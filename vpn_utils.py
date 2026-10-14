@@ -22,7 +22,7 @@ IP_CACHE_TTL_SECONDS = 7 * 24 * 3600
 
 ip_cache_lock = threading.RLock()
 _cleanip_token_lock = threading.Lock()
-_cleanip_token_cache: tuple[str | None, float] = (None, 0.0)
+_cleanip_token_cache: dict[str, tuple[str, float]] = {}
 CLEANIP_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 physical_interface_lock = threading.Lock()
 physical_interface_cache: tuple[str | None, float] = (None, 0.0)
@@ -1114,6 +1114,48 @@ def parse_cleanip_html_payload(html_text: str, target_ip: str) -> dict[str, Any]
 
     return build_cleanip_result_from_ip_obj(ip_obj, target_ip)
 
+def detect_local_vpn_proxy_url() -> tuple[str | None, str | None]:
+    """
+    Detect if the local AimiliVPN proxy (default 127.0.0.1:7928) is listening and tun0 is active.
+    Returns (proxy_url, proxy_user_pass) or (None, None).
+    """
+    if os.name != "nt":
+        tun0 = Path("/sys/class/net/tun0")
+        if not tun0.exists():
+            return None, None
+
+    proxy_port = 7928
+    try:
+        ui_auth_path = DATA_DIR / "ui_auth.json"
+        if ui_auth_path.exists():
+            cfg = json.loads(ui_auth_path.read_text(encoding="utf-8"))
+            if isinstance(cfg, dict) and cfg.get("proxy_port"):
+                proxy_port = _safe_int(cfg.get("proxy_port"), 7928)
+    except Exception:
+        pass
+    env_port = os.environ.get("LOCAL_PROXY_PORT")
+    if env_port:
+        proxy_port = _safe_int(env_port, proxy_port)
+
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.8)
+        s.connect(("127.0.0.1", proxy_port))
+    except Exception:
+        return None, None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    user = os.environ.get("LOCAL_PROXY_USER") or os.environ.get("LOCAL_PROXY_USERNAME")
+    password = os.environ.get("LOCAL_PROXY_PASS") or os.environ.get("LOCAL_PROXY_PASSWORD")
+    user_pass = f"{user}:{password or ''}" if user is not None else None
+    return f"socks5h://127.0.0.1:{proxy_port}", user_pass
+
 def solve_cleanip_pow(seed: str, difficulty: int = 4, max_attempts: int = 2_000_000) -> str | None:
     seed_str = str(seed or "").strip()
     if not seed_str:
@@ -1130,15 +1172,16 @@ def solve_cleanip_pow(seed: str, difficulty: int = 4, max_attempts: int = 2_000_
 def get_cleanip_anti_bot_token(
     *,
     via_proxy: str | None = None,
+    proxy_auth: str | None = None,
     force_new: bool = False,
-) -> str | None:
-    global _cleanip_token_cache
+) -> tuple[str | None, str]:
+    cache_key = via_proxy or "direct"
     now_ms = time.time() * 1000.0
-    if not via_proxy and not force_new:
+    if not force_new:
         with _cleanip_token_lock:
-            cached_tok, cached_exp = _cleanip_token_cache
-            if cached_tok and cached_exp - now_ms > 30_000:
-                return cached_tok
+            cached = _cleanip_token_cache.get(cache_key)
+            if cached and cached[0] and cached[1] - now_ms > 30_000:
+                return cached[0], ""
 
     curl_bin = "curl.exe" if os.name == "nt" else "curl"
     ch_cmd = [
@@ -1151,25 +1194,30 @@ def get_cleanip_anti_bot_token(
         CLEANIP_BROWSER_UA,
         "-H",
         "Accept: application/json",
+        "-H",
+        "Referer: https://cleanip.io/",
         "https://cleanip.io/api/v2/challenge",
     ]
     if via_proxy:
         ch_cmd.extend(["-x", via_proxy])
+        if proxy_auth:
+            ch_cmd.extend(["--proxy-user", proxy_auth])
     ch_res = subprocess.run(ch_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
     if ch_res.returncode != 0 or not ch_res.stdout.strip():
-        return None
+        return None, (ch_res.stderr or "").strip() or f"challenge curl exit {ch_res.returncode}"
     try:
         ch_data = json.loads(ch_res.stdout)
     except Exception:
-        return None
+        snippet = ch_res.stdout.strip()[:80].replace("\n", " ")
+        return None, f"challenge 非 JSON 响应 ({snippet})"
     if not isinstance(ch_data, dict) or not ch_data.get("ok") or not ch_data.get("seed"):
-        return None
+        return None, f"challenge 响应无效: {str(ch_data)[:100]}"
 
     seed = str(ch_data["seed"])
     difficulty = _safe_int(ch_data.get("difficulty"), 4)
     nonce = solve_cleanip_pow(seed, difficulty)
     if not nonce:
-        return None
+        return None, "PoW 计算超时"
 
     tok_payload = json.dumps({"seed": seed, "nonce": nonce})
     tok_cmd = [
@@ -1186,37 +1234,48 @@ def get_cleanip_anti_bot_token(
         "Content-Type: application/json",
         "-H",
         "Accept: application/json",
+        "-H",
+        "Origin: https://cleanip.io",
+        "-H",
+        "Referer: https://cleanip.io/",
         "-d",
         tok_payload,
         "https://cleanip.io/api/v2/token",
     ]
     if via_proxy:
         tok_cmd.extend(["-x", via_proxy])
+        if proxy_auth:
+            tok_cmd.extend(["--proxy-user", proxy_auth])
     tok_res = subprocess.run(tok_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
     if tok_res.returncode != 0 or not tok_res.stdout.strip():
-        return None
+        return None, (tok_res.stderr or "").strip() or f"token curl exit {tok_res.returncode}"
     try:
         tok_data = json.loads(tok_res.stdout)
     except Exception:
-        return None
+        snippet = tok_res.stdout.strip()[:80].replace("\n", " ")
+        return None, f"token 非 JSON 响应 ({snippet})"
     token = str(tok_data.get("token") or "").strip() if isinstance(tok_data, dict) and tok_data.get("ok") else ""
     if not token:
-        return None
+        return None, f"token 获取失败: {str(tok_data)[:100]}"
     exp_ms = float(tok_data.get("exp") or (now_ms + 180_000))
-    if not via_proxy:
-        with _cleanip_token_lock:
-            _cleanip_token_cache = (token, exp_ms)
-    return token
+    with _cleanip_token_lock:
+        _cleanip_token_cache[cache_key] = (token, exp_ms)
+    return token, ""
 
 def query_cleanip_api_v2(
     target_ip: str,
     *,
     via_proxy: str | None = None,
+    proxy_auth: str | None = None,
 ) -> dict[str, Any]:
     curl_bin = "curl.exe" if os.name == "nt" else "curl"
     last_error = ""
     for attempt in range(2):
-        token = get_cleanip_anti_bot_token(via_proxy=via_proxy, force_new=(attempt > 0))
+        token, tok_err = get_cleanip_anti_bot_token(
+            via_proxy=via_proxy,
+            proxy_auth=proxy_auth,
+            force_new=(attempt > 0),
+        )
         headers = [
             "-A",
             CLEANIP_BROWSER_UA,
@@ -1224,6 +1283,8 @@ def query_cleanip_api_v2(
             "Accept: application/json",
             "-H",
             "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
+            "-H",
+            f"Referer: https://cleanip.io/{urllib.parse.quote(target_ip)}",
         ]
         if token:
             headers.extend(["-H", f"X-Anti-Bot-Token: {token}"])
@@ -1231,19 +1292,27 @@ def query_cleanip_api_v2(
         cmd = [curl_bin, "-sS", "-L", "--max-time", "15", *headers, api_url]
         if via_proxy:
             cmd.extend(["-x", via_proxy])
+            if proxy_auth:
+                cmd.extend(["--proxy-user", proxy_auth])
         res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
         if res.returncode != 0 or not res.stdout.strip():
-            last_error = (res.stderr or "").strip() or f"curl exit {res.returncode}"
+            last_error = (res.stderr or "").strip() or tok_err or f"curl exit {res.returncode}"
             continue
         try:
             payload = json.loads(res.stdout)
         except Exception as exc:
-            last_error = f"JSON 解析失败: {exc}"
+            last_error = tok_err or f"JSON 解析失败: {exc}"
             continue
         if isinstance(payload, dict) and payload.get("ok") and (payload.get("purity") or payload.get("ip")):
             return build_cleanip_result_from_ip_obj(payload, target_ip)
-        err_msg = str(payload.get("error") or payload.get("message") or "").strip() if isinstance(payload, dict) else ""
-        last_error = err_msg or "API 未返回有效详情"
+        if isinstance(payload, dict):
+            if payload.get("verify") == "turnstile":
+                last_error = "当前请求出口 IP (如 AWS/机房 IP) 被 CleanIP 要求 Cloudflare Turnstile 真人验证"
+            else:
+                err_msg = str(payload.get("error") or payload.get("message") or "").strip()
+                last_error = f"{err_msg}" + (f" / {tok_err}" if tok_err else "") if err_msg else (tok_err or "API 未返回有效详情")
+        else:
+            last_error = tok_err or "API 未返回有效详情"
     raise ValueError(f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情 ({last_error})" if last_error else f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情")
 
 def parse_cleanip_cli_text(raw_text: str, fallback_ip: str = "") -> dict[str, Any]:
@@ -1324,49 +1393,88 @@ def query_cleanip_for_ip(
 
     curl_bin = "curl.exe" if os.name == "nt" else "curl"
     result_data: dict[str, Any] | None = None
+    auto_proxy_url, auto_proxy_auth = detect_local_vpn_proxy_url()
 
     if use_cli_endpoint:
+        eff_proxy = via_proxy or auto_proxy_url
         cmd = [curl_bin, "-sS", "-L", "--max-time", "14"]
-        if via_proxy:
-            cmd.extend(["-x", via_proxy])
+        if eff_proxy:
+            cmd.extend(["-x", eff_proxy])
+            if auto_proxy_auth and eff_proxy == auto_proxy_url:
+                cmd.extend(["--proxy-user", auto_proxy_auth])
         cmd.append("https://cleanip.io/cli")
         res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=16)
         if res.returncode == 0 and res.stdout.strip():
-            result_data = parse_cleanip_cli_text(res.stdout, fallback_ip=target_ip)
-            if not target_ip:
-                target_ip = str(result_data.get("ip") or "").strip()
+            try:
+                result_data = parse_cleanip_cli_text(res.stdout, fallback_ip=target_ip)
+                if not target_ip:
+                    target_ip = str(result_data.get("ip") or "").strip()
+            except Exception:
+                result_data = None
 
     if result_data is None:
         if not is_valid_ip_address(target_ip):
             raise RuntimeError("未能获取到有效的出口 IP 地址进行 CleanIP 查询")
-        # 1. Prefer CleanIP API v2 with PoW anti-bot token (works reliably even when SSR HTML omits q:<ip>)
-        try:
-            result_data = query_cleanip_api_v2(target_ip, via_proxy=via_proxy)
-        except Exception:
-            result_data = None
 
-        # 2. Fallback to SSR HTML payload parsing
+        # Build candidate route list: if active VPN tunnel proxy is available, try it first (avoids VPS datacenter IP Turnstile block)
+        route_candidates: list[tuple[str | None, str | None]] = []
+        if via_proxy:
+            route_candidates.append((via_proxy, auto_proxy_auth if via_proxy == auto_proxy_url else None))
+            route_candidates.append((None, None))
+        else:
+            if auto_proxy_url:
+                route_candidates.append((auto_proxy_url, auto_proxy_auth))
+            route_candidates.append((None, None))
+
+        api_errors: list[str] = []
+        for route_proxy, route_auth in route_candidates:
+            try:
+                result_data = query_cleanip_api_v2(
+                    target_ip,
+                    via_proxy=route_proxy,
+                    proxy_auth=route_auth,
+                )
+                if result_data is not None:
+                    break
+            except Exception as api_exc:
+                api_errors.append(str(api_exc))
+                result_data = None
+
+        # Fallback to SSR HTML payload parsing across the same routes
         if result_data is None:
-            url = f"https://cleanip.io/{urllib.parse.quote(target_ip)}"
-            cmd = [
-                curl_bin,
-                "-sS",
-                "-L",
-                "--max-time",
-                "15",
-                "-A",
-                CLEANIP_BROWSER_UA,
-                "-H",
-                "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
-                url,
-            ]
-            if via_proxy:
-                cmd.extend(["-x", via_proxy])
-            res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
-            if res.returncode != 0 or not res.stdout.strip():
-                err_detail = (res.stderr or "").strip() or f"curl exit {res.returncode}"
-                raise RuntimeError(f"请求 CleanIP 失败: {err_detail}")
-            result_data = parse_cleanip_html_payload(res.stdout, target_ip)
+            for route_proxy, route_auth in route_candidates:
+                try:
+                    url = f"https://cleanip.io/{urllib.parse.quote(target_ip)}"
+                    cmd = [
+                        curl_bin,
+                        "-sS",
+                        "-L",
+                        "--max-time",
+                        "15",
+                        "-A",
+                        CLEANIP_BROWSER_UA,
+                        "-H",
+                        "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
+                        url,
+                    ]
+                    if route_proxy:
+                        cmd.extend(["-x", route_proxy])
+                        if route_auth:
+                            cmd.extend(["--proxy-user", route_auth])
+                    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
+                    if res.returncode == 0 and res.stdout.strip():
+                        result_data = parse_cleanip_html_payload(res.stdout, target_ip)
+                        if result_data is not None:
+                            break
+                except Exception as html_exc:
+                    if not api_errors:
+                        api_errors.append(str(html_exc))
+
+        if result_data is None:
+            detail = api_errors[0] if api_errors else f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情"
+            if "Turnstile" in detail and not auto_proxy_url:
+                detail += "（建议先连接任意一个可用 VPN 节点，系统将自动通过 VPN 住宅出口向 CleanIP 查询）"
+            raise ValueError(detail)
 
     if target_ip and is_valid_ip_address(target_ip):
         with ip_cache_lock:
