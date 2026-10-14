@@ -88,6 +88,7 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
             mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
             mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
+            mock.patch.object(manager, "FAVORITES_FILE", root / "favorites.json"),
             mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
             mock.patch.object(manager.vpn_utils, "DATA_DIR", root),
             mock.patch.object(manager.vpn_utils, "IP_CACHE_FILE", root / "ip_cache.json"),
@@ -1042,6 +1043,144 @@ class ManagerLogicTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "no valid nodes"):
             snapshot_utils.parse_and_validate_snapshot(csv_text)
+
+    def test_favorite_nodes_persist_across_subscription_refresh(self) -> None:
+        # 1. Seed a favorite node that will NOT be present in the next subscription refresh
+        fav_node = {
+            "id": "JP_203.0.113.88_1194_udp",
+            "country": "日本",
+            "country_short": "JP",
+            "ip": "203.0.113.88",
+            "remote_host": "203.0.113.88",
+            "remote_port": 1194,
+            "proto": "udp",
+            "ping": 15,
+            "score": 99999,
+            "config_text": "client\ndev tun\nproto udp\nremote 203.0.113.88 1194 udp\n",
+            "config_file": str(manager.CONFIG_DIR / "JP_203.0.113.88_1194_udp.ovpn"),
+            "probe_status": "available",
+            "latency_ms": 28,
+            "probed_at": 1000.0,
+            "cleanip_score": 92,
+            "cleanip_grade": "A",
+            "active": False,
+        }
+        manager.write_json(manager.NODES_FILE, [fav_node])
+        ui_cfg = manager.load_ui_config()
+        ui_cfg["favorite_node_ids"] = [fav_node["id"]]
+        ui_cfg["connection_enabled"] = False
+        manager.write_json(manager.DATA_DIR / "ui_auth.json", ui_cfg)
+        manager.sync_favorite_snapshots_with_nodes(fav_ids=[fav_node["id"]])
+
+        # 2. Refresh candidates with a brand-new node list that omits the favorite node
+        fresh_candidate = {
+            "id": "US_198.51.100.77_443_tcp",
+            "country": "美国",
+            "country_short": "US",
+            "ip": "198.51.100.77",
+            "remote_host": "198.51.100.77",
+            "remote_port": 443,
+            "proto": "tcp",
+            "ping": 40,
+            "score": 50000,
+            "config_text": "client\ndev tun\nproto tcp\nremote 198.51.100.77 443 tcp\n",
+            "config_file": str(manager.CONFIG_DIR / "US_198.51.100.77_443_tcp.ovpn"),
+            "probe_status": "not_checked",
+            "probed_at": 0,
+            "active": False,
+        }
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=[fresh_candidate]),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+        ):
+            manager.maintain_valid_nodes(force=True)
+
+        merged_nodes = manager.read_nodes()
+        merged_ids = [n["id"] for n in merged_nodes]
+        self.assertIn("JP_203.0.113.88_1194_udp", merged_ids)
+        self.assertIn("US_198.51.100.77_443_tcp", merged_ids)
+        restored_fav = next(n for n in merged_nodes if n["id"] == "JP_203.0.113.88_1194_udp")
+        self.assertEqual("available", restored_fav["probe_status"])
+        self.assertEqual(28, restored_fav["latency_ms"])
+        self.assertEqual(92, restored_fav["cleanip_score"])
+        self.assertFalse(restored_fav["in_latest_feed"])
+
+    def test_batch_probe_tests_all_selected_nodes_when_target_available_is_none(self) -> None:
+        nodes = self.write_nodes(8)
+        selected_ids = [n["id"] for n in nodes[:7]]
+
+        def fake_openvpn(config_file, **kwargs):
+            return True, "ready", None
+
+        progress_steps = []
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=18),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+            mock.patch.object(manager, "NODE_PROBE_WORKERS", 3),
+        ):
+            results = manager.test_multiple_nodes(
+                selected_ids,
+                target_available=None,
+                progress_callback=lambda done, total, _res: progress_steps.append((done, total)),
+            )
+
+        self.assertEqual(7, len(results))
+        self.assertEqual((7, 7), progress_steps[-1])
+
+    def test_cleanip_cli_and_html_parsers_extract_scores_and_report(self) -> None:
+        sample_cli = (
+            "\x1b[38;2;53;169;82m██\x1b[0m  CleanIP.io\n"
+            "  IP              13.158.134.77  (IPv4)\n"
+            "  IP 类型          机房 IP \n"
+            "  原生 / 广播      广播 IP \n"
+            "  住宅概率        5%\n"
+            "  纯净度评分      █████████████████░░░ 85/100 (A)\n"
+            "  风险评分        15/100 低风险  ← 越低越好\n"
+        )
+        parsed_cli = manager.vpn_utils.parse_cleanip_cli_text(sample_cli)
+        self.assertEqual("13.158.134.77", parsed_cli["ip"])
+        self.assertEqual(85, parsed_cli["cleanip_score"])
+        self.assertEqual("A", parsed_cli["cleanip_grade"])
+        self.assertFalse(parsed_cli["cleanip_is_native"])
+        self.assertEqual(5, parsed_cli["cleanip_residential_prob"])
+        self.assertNotIn("\x1b[", parsed_cli["cleanip_report"])
+
+        nuxt_payload = [
+            {"q:198.51.100.99": 1},
+            {
+                "ip": {
+                    "ip": "198.51.100.99",
+                    "hostname": "res.example.jp",
+                    "geo": {"country": "日本", "region": "东京都", "city": "东京"},
+                    "network": {"asn": 4713, "asn_name": "NTT Communications", "native_or_broadcast": "NATIVE"},
+                    "risk": {"risk_score": 8, "risk_label": "Clean"},
+                    "purity": {
+                        "score": 94,
+                        "grade": "A",
+                        "is_native": True,
+                        "native_label": "Native IP",
+                        "ip_type": "ISP",
+                        "residential_probability": 92,
+                        "platform_scores": {"ai_subscription": 95, "tiktok": 90},
+                        "recommendation": "理想住宅出口",
+                    },
+                    "ip_environment": {"score": 91, "grade": "A"},
+                    "checks": [{"label": "VPN 检测", "verdict": "未检测到 VPN", "status": "pass"}],
+                }
+            },
+        ]
+        html_doc = f'<html><body><script id="__NUXT_DATA__" type="application/json">{json.dumps(nuxt_payload)}</script></body></html>'
+        parsed_html = manager.vpn_utils.parse_cleanip_html_payload(html_doc, "198.51.100.99")
+        self.assertEqual(94, parsed_html["cleanip_score"])
+        self.assertEqual("A", parsed_html["cleanip_grade"])
+        self.assertEqual(91, parsed_html["cleanip_env_score"])
+        self.assertTrue(parsed_html["cleanip_is_native"])
+        self.assertEqual("原生 IP", parsed_html["cleanip_native_label"])
+        self.assertEqual(92, parsed_html["cleanip_residential_prob"])
+        self.assertEqual(95, parsed_html["cleanip_ai_score"])
+        self.assertIn("CleanIP.io", parsed_html["cleanip_report"])
+        self.assertIn("94/100 (A)", parsed_html["cleanip_report"])
 
 
 class ProxyServerConcurrencyTests(unittest.TestCase):

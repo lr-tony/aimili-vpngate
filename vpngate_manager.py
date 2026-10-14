@@ -161,6 +161,7 @@ UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 API_CACHE_FILE = DATA_DIR / "api_snapshot.csv"
 API_CACHE_META_FILE = DATA_DIR / "api_snapshot.meta.json"
+FAVORITES_FILE = DATA_DIR / "favorites.json"
 BUNDLED_SNAPSHOT_FILE = ROOT_DIR / "mirror" / "vpngate.csv"
 WEB_LOG_MAX_ENTRIES = 500
 
@@ -170,6 +171,13 @@ connection_attempt_lock = threading.Lock()
 background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
 background_refill_thread: threading.Thread | None = None
+batch_test_cancel_event = threading.Event()
+batch_test_running = False
+batch_test_total = 0
+batch_test_completed = 0
+cleanip_batch_running = False
+cleanip_batch_total = 0
+cleanip_batch_completed = 0
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 pending_openvpn_process: subprocess.Popen[str] | None = None
@@ -202,6 +210,7 @@ IP_ENRICHMENT_FIELDS = (
     "ip_type_confidence",
     "ip_type_sources",
     "geo_country_short",
+    *vpn_utils.CLEANIP_NODE_FIELDS,
 )
 
 class ConnectionCancelled(RuntimeError):
@@ -491,6 +500,85 @@ def read_nodes() -> list[dict[str, Any]]:
         return []
     return [item for item in raw if isinstance(item, dict)]
 
+def load_favorite_snapshots() -> dict[str, dict[str, Any]]:
+    raw = read_json(FAVORITES_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(k): dict(v)
+        for k, v in raw.items()
+        if k and isinstance(v, dict) and v.get("id")
+    }
+
+def save_favorite_snapshots(snapshots: dict[str, dict[str, Any]]) -> None:
+    cleaned = {
+        str(k): dict(v)
+        for k, v in snapshots.items()
+        if k and isinstance(v, dict) and v.get("id")
+    }
+    write_json(FAVORITES_FILE, cleaned)
+
+def sync_favorite_snapshots_with_nodes(
+    fav_ids: list[str] | None = None,
+    nodes: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    with lock:
+        ui_cfg = load_ui_config()
+        effective_fav_ids = [
+            str(fid).strip()
+            for fid in (fav_ids if fav_ids is not None else ui_cfg.get("favorite_node_ids", []))
+            if str(fid or "").strip()
+        ]
+        current_nodes = list(nodes) if nodes is not None else read_nodes()
+        snapshots = load_favorite_snapshots()
+        snapshots_changed = False
+        nodes_changed = False
+
+        current_by_id = {str(n.get("id")): n for n in current_nodes if n.get("id")}
+        fav_id_set = set(effective_fav_ids)
+
+        for existing_id in list(snapshots.keys()):
+            if existing_id not in fav_id_set:
+                snapshots.pop(existing_id, None)
+                snapshots_changed = True
+
+        for fid in effective_fav_ids:
+            if fid in current_by_id:
+                node_copy = dict(current_by_id[fid])
+                prev_snap = snapshots.get(fid)
+                if isinstance(prev_snap, dict):
+                    if not node_copy.get("config_text") and prev_snap.get("config_text"):
+                        node_copy["config_text"] = prev_snap["config_text"]
+                    for field in IP_ENRICHMENT_FIELDS:
+                        if node_copy.get(field) in (None, "") and prev_snap.get(field) not in (None, ""):
+                            node_copy[field] = prev_snap[field]
+                if snapshots.get(fid) != node_copy:
+                    snapshots[fid] = node_copy
+                    snapshots_changed = True
+            elif fid in snapshots:
+                restored = dict(snapshots[fid])
+                restored["active"] = bool(active_openvpn_node_id and restored.get("id") == active_openvpn_node_id)
+                config_file = restored.get("config_file") or str(CONFIG_DIR / f"{fid}.ovpn")
+                restored["config_file"] = str(config_file)
+                if restored.get("config_text"):
+                    try:
+                        cfg_path = Path(config_file)
+                        if not cfg_path.exists():
+                            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+                            cfg_path.write_text(str(restored["config_text"]), encoding="utf-8")
+                    except Exception:
+                        pass
+                current_nodes.append(restored)
+                current_by_id[fid] = restored
+                nodes_changed = True
+
+        if snapshots_changed:
+            save_favorite_snapshots(snapshots)
+        if nodes_changed and nodes is None:
+            current_nodes = sort_all_nodes(current_nodes)
+            write_json(NODES_FILE, current_nodes)
+        return current_nodes
+
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
     state = read_json(STATE_FILE, {})
@@ -532,6 +620,12 @@ def get_state() -> dict[str, Any]:
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["discovery_countries"] = normalize_discovery_countries(ui_cfg.get("discovery_countries"))
     state["fav_fail_fallback"] = False
+    state["batch_test_running"] = batch_test_running
+    state["batch_test_total"] = batch_test_total
+    state["batch_test_completed"] = batch_test_completed
+    state["cleanip_batch_running"] = cleanip_batch_running
+    state["cleanip_batch_total"] = cleanip_batch_total
+    state["cleanip_batch_completed"] = cleanip_batch_completed
     
     return state
 
@@ -1953,10 +2047,17 @@ def is_systemic_probe_failure(message: Any) -> bool:
         )
     )
 
-def test_multiple_nodes(node_ids: list[str], target_available: int | None = None) -> list[dict[str, Any]]:
+def test_multiple_nodes(
+    node_ids: list[str],
+    target_available: int | None = None,
+    cancel_event: threading.Event | None = None,
+    progress_callback: Any = None,
+) -> list[dict[str, Any]]:
     with lock:
         nodes = read_nodes()
-        to_test = [n for n in nodes if n.get("id") in node_ids]
+        id_order = {nid: idx for idx, nid in enumerate(node_ids)}
+        to_test = [n for n in nodes if n.get("id") in id_order]
+        to_test.sort(key=lambda item: id_order.get(str(item.get("id")), 999999))
         
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
@@ -1984,7 +2085,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         try:
             tun_idx = get_free_test_index()
             dev_name = f"tun{tun_idx}"
-            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
+            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name, cancel_event=cancel_event)
         finally:
             if tun_idx is not None:
                 release_test_index(tun_idx)
@@ -2012,7 +2113,11 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
     max_workers = min(NODE_PROBE_WORKERS, max(1, len(to_test)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         for batch_start in range(0, len(to_test), max_workers):
-            if systemic_failure or (target_available is not None and available_count >= target_available):
+            if (
+                systemic_failure
+                or (cancel_event is not None and cancel_event.is_set())
+                or (target_available is not None and available_count >= target_available)
+            ):
                 break
 
             batch = to_test[batch_start : batch_start + max_workers]
@@ -2054,6 +2159,11 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
                             current.update(result)
                             break
                     write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                if callable(progress_callback):
+                    try:
+                        progress_callback(len(updated_nodes_map), len(to_test), result)
+                    except Exception:
+                        pass
 
             if systemic_failure:
                 message = f"检测到系统级 OpenVPN 故障，已停止剩余节点探测: {systemic_failure}"
@@ -2078,6 +2188,10 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
                 n.update(updated_nodes_map[nid])
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
+        try:
+            sync_favorite_snapshots_with_nodes(nodes=sorted_nodes)
+        except Exception:
+            pass
         
     return list(updated_nodes_map.values())
 
@@ -2460,11 +2574,23 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         with lock:
             current_nodes = read_nodes()
+            ui_cfg_for_merge = load_ui_config()
+            fav_ids_list = [
+                str(fid).strip()
+                for fid in ui_cfg_for_merge.get("favorite_node_ids", [])
+                if str(fid or "").strip()
+            ]
+            fav_ids_set = set(fav_ids_list)
+            fav_snapshots = load_favorite_snapshots()
             current_by_id = {
                 str(n.get("id")): n
                 for n in current_nodes
                 if n.get("id")
             }
+            for fid, snap in fav_snapshots.items():
+                if fid not in current_by_id and isinstance(snap, dict):
+                    current_by_id[fid] = dict(snap)
+
             active_node = None
             if active_openvpn_node_id:
                 active_node = next((n for n in current_nodes if n.get("id") == active_openvpn_node_id), None)
@@ -2475,29 +2601,75 @@ def maintain_valid_nodes(force: bool = False) -> str:
             if active_node:
                 merged.append(active_node)
                 seen_ids.add(active_node["id"])
+
+            preserve_keys = [
+                "probe_status",
+                "probe_message",
+                "latency_ms",
+                "probed_at",
+                *IP_ENRICHMENT_FIELDS,
+            ]
+            candidate_by_id = {str(c.get("id")): c for c in candidates if c.get("id")}
+            candidate_by_ip = {
+                str(c.get("ip") or c.get("remote_host") or ""): c
+                for c in candidates
+                if (c.get("ip") or c.get("remote_host"))
+            }
+            fav_ids_updated = False
+
+            # First ensure all favorite nodes are preserved or updated from fresh candidates
+            for idx_fav, fid in enumerate(list(fav_ids_list)):
+                if fid in seen_ids:
+                    continue
+                if fid in candidate_by_id:
+                    cand = dict(candidate_by_id[fid])
+                    previous = current_by_id.get(fid)
+                    if previous:
+                        for key in preserve_keys:
+                            if previous.get(key) not in (None, ""):
+                                cand[key] = previous.get(key)
+                    cand["in_latest_feed"] = True
+                    merged.append(cand)
+                    seen_ids.add(fid)
+                else:
+                    previous = current_by_id.get(fid)
+                    if previous:
+                        prev_ip = str(previous.get("ip") or previous.get("remote_host") or "").strip()
+                        matched_cand = candidate_by_ip.get(prev_ip) if prev_ip else None
+                        if matched_cand and matched_cand["id"] not in seen_ids and matched_cand["id"] not in fav_ids_set:
+                            # Same IP changed port/proto: migrate favorite to new node id
+                            new_cand = dict(matched_cand)
+                            for key in preserve_keys:
+                                if previous.get(key) not in (None, ""):
+                                    new_cand[key] = previous.get(key)
+                            new_cand["in_latest_feed"] = True
+                            merged.append(new_cand)
+                            seen_ids.add(new_cand["id"])
+                            fav_ids_list[idx_fav] = new_cand["id"]
+                            fav_ids_set.discard(fid)
+                            fav_ids_set.add(new_cand["id"])
+                            fav_ids_updated = True
+                        else:
+                            restored = dict(previous)
+                            restored["active"] = False
+                            restored["in_latest_feed"] = False
+                            if not restored.get("config_file"):
+                                restored["config_file"] = str(CONFIG_DIR / f"{fid}.ovpn")
+                            merged.append(restored)
+                            seen_ids.add(fid)
+
+            if fav_ids_updated:
+                ui_cfg_for_merge["favorite_node_ids"] = fav_ids_list
+                write_json(DATA_DIR / "ui_auth.json", ui_cfg_for_merge)
                 
             for cand in candidates:
                 if cand["id"] not in seen_ids:
                     previous = current_by_id.get(str(cand["id"]))
                     if previous:
-                        for key in [
-                            "probe_status",
-                            "probe_message",
-                            "latency_ms",
-                            "probed_at",
-                            "owner",
-                            "asn",
-                            "as_name",
-                            "location",
-                            "ip_type",
-                            "quality",
-                            "is_proxy",
-                            "is_hosting",
-                            "is_mobile",
-                            "ip_type_reason",
-                        ]:
+                        for key in preserve_keys:
                             if previous.get(key) not in (None, ""):
                                 cand[key] = previous.get(key)
+                    cand["in_latest_feed"] = True
                     merged.append(cand)
                     seen_ids.add(cand["id"])
                     
@@ -2506,13 +2678,17 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 
             for n in merged:
                 config_path = Path(n["config_file"])
-                if not config_path.exists():
+                if not config_path.exists() and n.get("config_text"):
                     try:
                         config_path.write_text(n["config_text"], encoding="utf-8")
                     except Exception:
                         pass
                         
             write_json(NODES_FILE, merged)
+            try:
+                sync_favorite_snapshots_with_nodes(fav_ids=fav_ids_list, nodes=merged)
+            except Exception:
+                pass
             ip_enrichment_wakeup.set()
 
         initial_tested_ids: set[str] = set()
@@ -4143,6 +4319,106 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.3;
     }
 
+    .node-check-label {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      user-select: none;
+    }
+    .node-check-input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--primary);
+      cursor: pointer;
+      margin: 0;
+    }
+    .batch-bar {
+      background: rgba(15, 23, 42, 0.92);
+      border: 1px solid rgba(99, 102, 241, 0.28);
+      border-radius: 12px;
+      padding: 12px 16px;
+      margin-bottom: 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .batch-bar-left, .batch-bar-right {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .batch-mini-btn {
+      height: 32px;
+      padding: 0 12px;
+      font-size: 12px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+    }
+    .batch-mini-btn:hover:not(:disabled) {
+      border-color: rgba(99, 102, 241, 0.45);
+      background: rgba(99, 102, 241, 0.12);
+    }
+    .cleanip-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 7px;
+      border-radius: 5px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      border: 1px solid transparent;
+      line-height: 1.3;
+      white-space: nowrap;
+      transition: opacity 0.2s ease;
+    }
+    .cleanip-badge:hover {
+      opacity: 0.9;
+    }
+    .cleanip-grade-a {
+      background: rgba(16, 185, 129, 0.14);
+      color: #34d399;
+      border-color: rgba(16, 185, 129, 0.32);
+    }
+    .cleanip-grade-b {
+      background: rgba(56, 189, 248, 0.14);
+      color: #38bdf8;
+      border-color: rgba(56, 189, 248, 0.32);
+    }
+    .cleanip-grade-c {
+      background: rgba(245, 158, 11, 0.14);
+      color: #fbbf24;
+      border-color: rgba(245, 158, 11, 0.32);
+    }
+    .cleanip-grade-d {
+      background: rgba(244, 63, 94, 0.14);
+      color: #fb7185;
+      border-color: rgba(244, 63, 94, 0.32);
+    }
+    .cleanip-btn {
+      background: transparent;
+      color: #38bdf8;
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      border-radius: 6px;
+      padding: 0 8px;
+      height: 30px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .cleanip-btn:hover:not(:disabled) {
+      background: rgba(56, 189, 248, 0.18);
+      color: #e0f2fe;
+      border-color: rgba(56, 189, 248, 0.65);
+    }
+
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
         animation-duration: 0.01ms !important;
@@ -4289,26 +4565,60 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
       
-      <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 16px;">
+      <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 16px; display: flex; flex-direction: column; gap: 12px;">
+        <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+          <button type="button" class="batch-mini-btn" onclick="selectFavoriteNodes()">全选收藏节点</button>
+          <button type="button" class="test-btn" style="height: 32px; padding: 0 12px;" onclick="batchTestFavorites()">⚡ 一键检测全部收藏可用性</button>
+          <button type="button" class="cleanip-btn" style="height: 32px; padding: 0 12px;" onclick="batchCheckFavoritesCleanIp()">🛡️ 一键检测全部收藏纯净度</button>
+        </div>
         <div style="padding: 10px 14px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 8px; font-size: 12px; color: var(--warning); line-height: 1.5;">
+          <strong>收藏节点已启用防丢持久化保护：</strong>刷新节点列表或订阅源更新后，已收藏节点会自动保留在列表中，不会丢失。<br>
           <strong>仅用收藏是强锁定模式。</strong>开启后只会连接收藏节点；如果收藏节点全部不可用，系统不会切换到非收藏节点。
         </div>
       </div>
     </div>
   </div>
 
+  <section class="batch-bar" aria-label="批量选择与检测工具栏">
+    <div class="batch-bar-left">
+      <span style="font-size: 13px; color: var(--text-secondary); margin-right: 4px;">
+        已勾选 <strong id="selected_nodes_count" style="color: var(--primary);">0</strong> 个节点
+      </span>
+      <button type="button" class="batch-mini-btn" onclick="selectCurrentPageNodes()">全选本页</button>
+      <button type="button" class="batch-mini-btn" onclick="selectAllFilteredNodes()">全选当前筛选</button>
+      <button type="button" class="batch-mini-btn" onclick="selectUntestedFilteredNodes()">勾选待检测</button>
+      <button type="button" class="batch-mini-btn" onclick="clearSelectedNodes()">清空选择</button>
+    </div>
+    <div class="batch-bar-right">
+      <button id="btn_batch_test" type="button" class="btn-primary" style="height: 34px; padding: 0 14px; font-size: 12px;" onclick="runBatchAvailabilityTest()">
+        ⚡ 批量检测可用性
+      </button>
+      <button id="btn_cancel_batch_test" type="button" class="btn-danger" style="height: 34px; padding: 0 14px; font-size: 12px; display: none;" onclick="cancelBatchAvailabilityTest()">
+        ⏹ 停止检测
+      </button>
+      <button id="btn_batch_cleanip" type="button" class="cleanip-btn" style="height: 34px; padding: 0 14px; font-size: 12px;" onclick="runBatchCleanIpCheck()">
+        🛡️ 批量检测纯净度
+      </button>
+    </div>
+  </section>
+
   <div class="table-wrapper">
     <div class="table-container">
       <table>
         <thead>
           <tr>
+            <th style="width: 44px; text-align: center; padding: 14px 8px;">
+              <label class="node-check-label" title="全选/取消本页节点">
+                <input id="select_all_page_checkbox" class="node-check-input" type="checkbox" aria-label="全选本页节点" onchange="toggleSelectPageCheckbox(this)">
+              </label>
+            </th>
             <th style="width: 90px;">状态</th>
-            <th style="width: 220px;">IP 地址 : 端口</th>
+            <th style="width: 210px;">IP 地址 : 端口</th>
             <th style="width: 125px;">延迟</th>
             <th>物理位置</th>
             <th>运营主体 / ISP</th>
-            <th style="width: 110px;">IP 类型</th>
-            <th style="width: 230px;">操作</th>
+            <th style="width: 165px;">IP 类型 / 纯净度</th>
+            <th style="width: 265px;">操作</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -4610,9 +4920,42 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+
+  <!-- CleanIP Modal (IP 纯净度检测报告) -->
+  <div id="cleanip_modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="cleanip_modal_title" aria-hidden="true">
+    <div class="modal-content" tabindex="-1" style="max-width: 760px; width: 95%;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
+        <h3 id="cleanip_modal_title" style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: #38bdf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
+          CleanIP.io 纯净度与风控检测报告
+        </h3>
+        <button type="button" aria-label="关闭纯净度报告" onclick="closeCleanIpModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+
+      <div id="cleanip_summary_bar" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 10px; padding: 12px 16px; margin-bottom: 14px; font-size: 13px; color: var(--text-secondary); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+        <span id="cleanip_summary_text">正在查询 CleanIP 数据...</span>
+        <a id="cleanip_external_link" href="https://cleanip.io" target="_blank" rel="noopener noreferrer" style="color: #38bdf8; text-decoration: none; font-weight: 600;">在 CleanIP.io 查看完整网页报告 ↗</a>
+      </div>
+
+      <div id="cleanip_terminal_container" style="background: #050811; border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 10px; height: 360px; padding: 16px; overflow-y: auto; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12.5px; line-height: 1.55; text-align: left; white-space: pre-wrap; word-break: break-all; color: #e2e8f0; box-shadow: inset 0 4px 20px rgba(0,0,0,0.8); margin-bottom: 18px;">正在加载报告...</div>
+
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button type="button" onclick="copyCleanIpReport()" class="btn-primary" style="height: 36px; padding: 0 14px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">一键复制报告</button>
+          <button id="btn_refresh_cleanip_modal" type="button" onclick="refreshCurrentCleanIpModal()" class="cleanip-btn" style="height: 36px; padding: 0 14px;">🔄 重新实时检测</button>
+        </div>
+        <button type="button" onclick="closeCleanIpModal()" style="height: 36px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
+      </div>
+    </div>
+  </div>
 </main>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
+const selectedNodeIds = new Set();
+const cleanIpTestingIds = new Set();
+let currentCleanIpContext = { nodeId: "", ip: "", viaProxy: false };
 const favoriteRequestIds = new Set();
 let disconnectInFlight = false;
 let currentPage = 1;
@@ -4689,6 +5032,7 @@ function closeActiveModal() {
   else if (activeModalId === "vps_recommend_modal") closeVpsModal();
   else if (activeModalId === "gateway_modal") closeGatewayModal();
   else if (activeModalId === "logs_modal") closeLogsModal();
+  else if (activeModalId === "cleanip_modal") closeCleanIpModal();
 }
 document.querySelectorAll(".modal").forEach(modal => {
   modal.addEventListener("mousedown", event => {
@@ -4850,6 +5194,32 @@ function nodeLatencyHtml(node) {
   return "-";
 }
 
+function getCleanIpGradeClass(grade, score) {
+  const g = String(grade || "").toUpperCase();
+  const s = Number(score);
+  if (g.startsWith("A") || s >= 85) return "cleanip-grade-a";
+  if (g.startsWith("B") || s >= 70) return "cleanip-grade-b";
+  if (g.startsWith("C") || s >= 50) return "cleanip-grade-c";
+  return "cleanip-grade-d";
+}
+
+function renderNodeCleanIpBadge(node) {
+  if (!node) return "";
+  const isChecking = cleanIpTestingIds.has(node.id);
+  if (isChecking) {
+    return `<span class="cleanip-badge cleanip-grade-b" style="margin-top:4px;">检测中...</span>`;
+  }
+  const hasScore = node.cleanip_score !== undefined && node.cleanip_score !== null && node.cleanip_score !== "";
+  if (!hasScore) return "";
+  const score = Number(node.cleanip_score);
+  const grade = String(node.cleanip_grade || "B");
+  const nativeShort = node.cleanip_is_native ? "原生" : (String(node.cleanip_native_label || "").includes("广播") ? "广播" : "");
+  const badgeClass = getCleanIpGradeClass(grade, score);
+  const summaryTitle = node.cleanip_summary || `纯净度: ${score}/100 (${grade})`;
+  const labelText = `${grade} ${score}分${nativeShort ? "·" + nativeShort : ""}`;
+  return `<button type="button" class="cleanip-badge ${badgeClass}" style="margin-top: 4px;" title="${esc(summaryTitle)}（点击查看完整 CleanIP 报告）" onclick="openNodeCleanIpModal('${esc(node.id)}', event)">🛡️ ${esc(labelText)}</button>`;
+}
+
 function syncDiscoveryCountriesFromState() {
   if (discoveryCountriesInitialized && discoveryCountriesDirty) return;
   const saved = Array.isArray(state.discovery_countries) ? state.discovery_countries : [];
@@ -4953,10 +5323,15 @@ function clearDiscoveryCountries(event) {
 function getFilteredNodes() {
   const selectedIpType = $("ip_type_filter").value;
   const selectedStatus = $("status_filter").value;
+  const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
   return nodes.filter(n => {
     if (!n) return false;
+    const isFavNode = favoriteIds.includes(n.id);
+    if (showFavoritesOnly && !isFavNode) {
+      return false;
+    }
     const countryCode = String(n.country_short || "").trim().toUpperCase();
-    if (selectedDiscoveryCountries.size && !selectedDiscoveryCountries.has(countryCode)) {
+    if (!showFavoritesOnly && selectedDiscoveryCountries.size && !selectedDiscoveryCountries.has(countryCode)) {
       return false;
     }
     if (selectedIpType) {
@@ -5062,10 +5437,16 @@ function render(){
             </div>
           </div>
         </div>
-        <button class="btn-danger" ${disconnectInFlight ? "disabled" : ""} style="height: 38px; padding: 0 16px; border-radius: 8px;" onclick="disconnectNode()">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-          断开连接
-        </button>
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+          ${activeNode.cleanip_score !== undefined && activeNode.cleanip_score !== "" ? renderNodeCleanIpBadge(activeNode) : ""}
+          <button type="button" class="cleanip-btn" style="height: 38px; padding: 0 14px; border-radius: 8px;" onclick="checkActiveExitCleanIp(event)">
+            🛡️ 检测出口纯净度
+          </button>
+          <button class="btn-danger" ${disconnectInFlight ? "disabled" : ""} style="height: 38px; padding: 0 16px; border-radius: 8px;" onclick="disconnectNode()">
+            <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+            断开连接
+          </button>
+        </div>
       </div>
     `;
   } else {
@@ -5165,7 +5546,7 @@ function render(){
   // Render table rows
   let rowsHtml = "";
   if (currentPageNodes.length === 0) {
-    rowsHtml = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
+    rowsHtml = `<tr><td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。<!-- colspan="7" legacy marker --></td></tr>`;
   } else {
     rowsHtml = currentPageNodes.map(n=>{
       if (!n) return '';
@@ -5202,16 +5583,34 @@ function render(){
         ? `<button class="test-btn" ${favoriteBusy ? "disabled" : ""} style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">${favoriteBusy ? "处理中" : "★ 已收藏"}</button>`
         : `<button class="test-btn" ${favoriteBusy ? "disabled" : ""} style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">${favoriteBusy ? "处理中" : "☆ 收藏"}</button>`;
 
+      const isChecked = selectedNodeIds.has(n.id);
+      const isCleanIpChecking = cleanIpTestingIds.has(n.id);
+      const cleanIpBadgeHtml = renderNodeCleanIpBadge(n);
+      const cleanIpBtnText = isCleanIpChecking ? "查询中" : (n.cleanip_score !== undefined && n.cleanip_score !== "" ? "报告" : "纯净度");
+      const cleanIpBtn = `<button class="cleanip-btn" ${isCleanIpChecking ? "disabled" : ""} onclick="openNodeCleanIpModal('${esc(n.id)}', event)" title="连接前免切换直接检测该节点 IP 的 CleanIP 纯净度与风控详情">${cleanIpBtnText}</button>`;
+      const cachedFavHint = (isFav && n.in_latest_feed === false) ? `<span style="font-size:10px; color:var(--warning); margin-left:4px;" title="该收藏节点暂未出现在最新公共广播中，已由本地收藏快照永久保活">★保活</span>` : "";
+
       return `<tr ${rowClass}>
+        <td style="text-align: center; padding: 14px 8px;">
+          <label class="node-check-label">
+            <input class="node-check-input" type="checkbox" value="${esc(n.id)}" ${isChecked ? "checked" : ""} onchange="toggleSelectNode('${esc(n.id)}', this.checked, event)">
+          </label>
+        </td>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="mono" style="white-space: nowrap; max-width: 210px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}${cachedFavHint}</td>
         <td style="white-space: nowrap;">${latencyText}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
-        <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">${esc(translateIpType(n.ip_type))}</td>
+        <td style="white-space: nowrap; max-width: 165px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">
+          <div style="display:flex; flex-direction:column; align-items:flex-start;">
+            <span>${esc(translateIpType(n.ip_type))}</span>
+            ${cleanIpBadgeHtml}
+          </div>
+        </td>
         <td>
           <div class="table-actions">
             ${testBtn}
+            ${cleanIpBtn}
             ${favBtn}
             ${connectBtn}
           </div>
@@ -5220,6 +5619,7 @@ function render(){
     }).join("");
   }
   setHtmlIfChanged($("rows"), rowsHtml);
+  updateBatchSelectionUI();
 
   // Render pagination controls
   $("page_start").textContent = shown.length > 0 ? startIndex + 1 : 0;
@@ -5299,6 +5699,349 @@ async function toggleFavorite(id, event) {
     favoriteRequestIds.delete(id);
     render();
   }
+}
+
+function updateBatchSelectionUI() {
+  const validNodeIds = new Set(nodes.map(n => n && n.id).filter(Boolean));
+  Array.from(selectedNodeIds).forEach(id => {
+    if (!validNodeIds.has(id)) selectedNodeIds.delete(id);
+  });
+
+  if ($("selected_nodes_count")) {
+    $("selected_nodes_count").textContent = selectedNodeIds.size;
+  }
+
+  const pageCheckbox = $("select_all_page_checkbox");
+  if (pageCheckbox) {
+    const pageIds = currentPageNodes.map(n => n && n.id).filter(Boolean);
+    const allPageSelected = pageIds.length > 0 && pageIds.every(id => selectedNodeIds.has(id));
+    const somePageSelected = pageIds.some(id => selectedNodeIds.has(id));
+    pageCheckbox.checked = allPageSelected;
+    pageCheckbox.indeterminate = !allPageSelected && somePageSelected;
+  }
+
+  const batchTestBtn = $("btn_batch_test");
+  const cancelBatchBtn = $("btn_cancel_batch_test");
+  const batchCleanBtn = $("btn_batch_cleanip");
+  const isBatchTesting = Boolean(state && state.batch_test_running);
+  const isCleanIpBatch = Boolean(state && state.cleanip_batch_running);
+
+  if (batchTestBtn) {
+    if (isBatchTesting) {
+      const done = state.batch_test_completed || 0;
+      const total = state.batch_test_total || 0;
+      batchTestBtn.disabled = true;
+      batchTestBtn.textContent = `⏳ 检测中 (${done}/${total})`;
+    } else {
+      batchTestBtn.disabled = Boolean(state && state.is_connecting);
+      batchTestBtn.textContent = selectedNodeIds.size > 0
+        ? `⚡ 批量检测选中 (${selectedNodeIds.size})`
+        : "⚡ 批量检测本页";
+    }
+  }
+  if (cancelBatchBtn) {
+    cancelBatchBtn.style.display = isBatchTesting ? "inline-flex" : "none";
+  }
+  if (batchCleanBtn) {
+    if (isCleanIpBatch) {
+      const done = state.cleanip_batch_completed || 0;
+      const total = state.cleanip_batch_total || 0;
+      batchCleanBtn.disabled = true;
+      batchCleanBtn.textContent = `🛡️ 纯净度检测中 (${done}/${total})`;
+    } else {
+      batchCleanBtn.disabled = false;
+      batchCleanBtn.textContent = selectedNodeIds.size > 0
+        ? `🛡️ 批量测纯净度 (${selectedNodeIds.size})`
+        : "🛡️ 批量测本页纯净度";
+    }
+  }
+}
+
+function toggleSelectNode(id, checked, event) {
+  if (event) event.stopPropagation();
+  if (!id) return;
+  if (checked) selectedNodeIds.add(id);
+  else selectedNodeIds.delete(id);
+  updateBatchSelectionUI();
+}
+
+function toggleSelectPageCheckbox(input) {
+  const checked = Boolean(input && input.checked);
+  currentPageNodes.forEach(n => {
+    if (!n || !n.id) return;
+    if (checked) selectedNodeIds.add(n.id);
+    else selectedNodeIds.delete(n.id);
+  });
+  render();
+}
+
+function selectCurrentPageNodes() {
+  currentPageNodes.forEach(n => {
+    if (n && n.id) selectedNodeIds.add(n.id);
+  });
+  render();
+}
+
+function selectAllFilteredNodes() {
+  const shown = getFilteredNodes();
+  shown.forEach(n => {
+    if (n && n.id) selectedNodeIds.add(n.id);
+  });
+  render();
+}
+
+function selectUntestedFilteredNodes() {
+  const shown = getFilteredNodes();
+  shown.forEach(n => {
+    if (n && n.id && (!n.probe_status || n.probe_status === "not_checked")) {
+      selectedNodeIds.add(n.id);
+    }
+  });
+  render();
+}
+
+function selectFavoriteNodes() {
+  const favIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
+  favIds.forEach(id => {
+    if (id) selectedNodeIds.add(id);
+  });
+  render();
+}
+
+function clearSelectedNodes() {
+  selectedNodeIds.clear();
+  render();
+}
+
+function getEffectiveTargetNodeIds(defaultLimit = 20) {
+  if (selectedNodeIds.size > 0) {
+    return Array.from(selectedNodeIds);
+  }
+  return currentPageNodes.slice(0, defaultLimit).map(n => n && n.id).filter(Boolean);
+}
+
+async function startBatchAvailabilityTestWithIds(targetIds) {
+  if (!targetIds || !targetIds.length) {
+    alert("当前没有可检测的节点，请先勾选节点。");
+    return;
+  }
+  try {
+    const response = await fetchWithTimeout("./api/test_nodes_batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: targetIds })
+    }, 25000);
+    const result = await readJsonResponse(response, "启动批量检测失败");
+    if (result.ok) {
+      await load();
+      startConnectionPolling();
+    }
+  } catch (e) {
+    alert("启动批量检测失败: " + (e.message || "未知错误"));
+  }
+}
+
+async function runBatchAvailabilityTest() {
+  const ids = getEffectiveTargetNodeIds(20);
+  await startBatchAvailabilityTestWithIds(ids);
+}
+
+async function batchTestFavorites() {
+  const favIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
+  if (!favIds.length) {
+    alert("您还没有收藏任何节点。");
+    return;
+  }
+  favIds.forEach(id => selectedNodeIds.add(id));
+  render();
+  await startBatchAvailabilityTestWithIds(favIds);
+}
+
+async function cancelBatchAvailabilityTest() {
+  try {
+    await fetchWithTimeout("./api/cancel_batch_test", { method: "POST" }, 15000);
+  } catch (e) {
+    alert("停止批量检测失败: " + (e.message || "未知错误"));
+  }
+}
+
+async function startBatchCleanIpWithIds(targetIds) {
+  if (!targetIds || !targetIds.length) {
+    alert("请先勾选要检测纯净度的节点。");
+    return;
+  }
+  try {
+    const response = await fetchWithTimeout("./api/check_cleanip_batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: targetIds })
+    }, 25000);
+    const result = await readJsonResponse(response, "启动批量纯净度检测失败");
+    if (result.ok) {
+      await load();
+      startCleanIpBatchPolling();
+    }
+  } catch (e) {
+    alert("启动批量纯净度检测失败: " + (e.message || "未知错误"));
+  }
+}
+
+async function runBatchCleanIpCheck() {
+  const ids = getEffectiveTargetNodeIds(10);
+  await startBatchCleanIpWithIds(ids);
+}
+
+async function batchCheckFavoritesCleanIp() {
+  const favIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
+  if (!favIds.length) {
+    alert("您还没有收藏任何节点。");
+    return;
+  }
+  favIds.forEach(id => selectedNodeIds.add(id));
+  render();
+  await startBatchCleanIpWithIds(favIds);
+}
+
+let cleanIpPollInterval = null;
+let cleanIpPollInFlight = false;
+function startCleanIpBatchPolling() {
+  if (cleanIpPollInterval) clearInterval(cleanIpPollInterval);
+  cleanIpPollInterval = setInterval(async () => {
+    if (cleanIpPollInFlight || !isPageVisible()) return;
+    cleanIpPollInFlight = true;
+    try {
+      const data = await fetchNodesSnapshot();
+      applyNodesSnapshot(data);
+      if (!state.cleanip_batch_running) {
+        clearInterval(cleanIpPollInterval);
+        cleanIpPollInterval = null;
+      }
+    } catch (e) {
+      clearInterval(cleanIpPollInterval);
+      cleanIpPollInterval = null;
+    } finally {
+      cleanIpPollInFlight = false;
+    }
+  }, 1500);
+}
+
+function closeCleanIpModal() {
+  hideModal("cleanip_modal");
+}
+
+function renderCleanIpModalContent(info) {
+  const summaryEl = $("cleanip_summary_text");
+  const linkEl = $("cleanip_external_link");
+  const termEl = $("cleanip_terminal_container");
+  if (!info) return;
+  if (summaryEl) {
+    summaryEl.textContent = info.cleanip_summary || `IP: ${info.ip || "-"} · 纯净度: ${info.cleanip_score ?? "-"}/100 (${info.cleanip_grade || "-"})`;
+  }
+  if (linkEl) {
+    linkEl.href = info.cleanip_url || (info.ip ? `https://cleanip.io/${encodeURIComponent(info.ip)}` : "https://cleanip.io");
+  }
+  if (termEl) {
+    termEl.textContent = info.cleanip_report || "暂无详细报告内容。";
+  }
+}
+
+async function requestCleanIp(options = {}) {
+  const { nodeId = "", ip = "", force = false, viaProxy = false, useCli = false } = options;
+  currentCleanIpContext = { nodeId, ip, viaProxy, useCli };
+  const summaryEl = $("cleanip_summary_text");
+  const termEl = $("cleanip_terminal_container");
+  const refreshBtn = $("btn_refresh_cleanip_modal");
+  if (summaryEl) summaryEl.textContent = "正在实时查询 CleanIP.io 多源风控与纯净度数据...";
+  if (termEl) termEl.textContent = "正在向 CleanIP.io 发起请求并解析 6 维纯净度、原生/广播属性与 AI/流媒体平台适配度，请稍候 (约 2~5 秒)...";
+  if (refreshBtn) refreshBtn.disabled = true;
+  if (nodeId) {
+    cleanIpTestingIds.add(nodeId);
+    render();
+  }
+  try {
+    const response = await fetchWithTimeout("./api/check_cleanip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: nodeId,
+        ip: ip,
+        force: force,
+        via_proxy: viaProxy,
+        use_cli: useCli
+      })
+    }, 35000);
+    const result = await readJsonResponse(response, "CleanIP 纯净度检测失败");
+    if (result.ok && result.cleanip) {
+      if (result.node && nodeId) {
+        const idx = nodes.findIndex(n => n && n.id === nodeId);
+        if (idx !== -1) nodes[idx] = result.node;
+      }
+      renderCleanIpModalContent(result.cleanip);
+    }
+  } catch (e) {
+    if (summaryEl) summaryEl.textContent = "检测失败";
+    if (termEl) termEl.textContent = "CleanIP 检测失败: " + (e.message || "未知网络错误");
+  } finally {
+    if (refreshBtn) refreshBtn.disabled = false;
+    if (nodeId) {
+      cleanIpTestingIds.delete(nodeId);
+      render();
+    }
+  }
+}
+
+async function openNodeCleanIpModal(nodeId, event) {
+  if (event) event.stopPropagation();
+  const node = nodes.find(n => n && n.id === nodeId);
+  if (!node) return;
+  const ip = node.ip || node.remote_host || "";
+  currentCleanIpContext = { nodeId, ip, viaProxy: false, useCli: false };
+  showModal("cleanip_modal", "#btn_refresh_cleanip_modal");
+  if (node.cleanip_report && node.cleanip_score !== undefined && node.cleanip_score !== "") {
+    renderCleanIpModalContent(node);
+    return;
+  }
+  await requestCleanIp({ nodeId, ip, force: false, viaProxy: false, useCli: false });
+}
+
+async function checkActiveExitCleanIp(event) {
+  if (event) event.stopPropagation();
+  const activeNode = nodes.find(n => n && n.active);
+  const nodeId = activeNode ? activeNode.id : "";
+  const ip = (activeNode && (activeNode.ip || activeNode.remote_host)) || state.proxy_ip || "";
+  showModal("cleanip_modal", "#btn_refresh_cleanip_modal");
+  await requestCleanIp({ nodeId, ip, force: true, viaProxy: true, useCli: true });
+}
+
+async function refreshCurrentCleanIpModal() {
+  await requestCleanIp({
+    nodeId: currentCleanIpContext.nodeId || "",
+    ip: currentCleanIpContext.ip || "",
+    force: true,
+    viaProxy: Boolean(currentCleanIpContext.viaProxy),
+    useCli: Boolean(currentCleanIpContext.useCli)
+  });
+}
+
+function copyCleanIpReport() {
+  const term = $("cleanip_terminal_container");
+  if (!term) return;
+  const text = term.innerText || term.textContent || "";
+  if (!text || text.includes("正在加载") || text.includes("正在向 CleanIP")) {
+    alert("当前没有可复制的检测报告。");
+    return;
+  }
+  navigator.clipboard.writeText(text).then(() => {
+    alert("CleanIP 报告已复制到剪贴板！");
+  }).catch(() => {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    alert("CleanIP 报告已复制到剪贴板！");
+  });
 }
 
 let pollInterval = null;
@@ -6625,7 +7368,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
-            nodes = read_nodes()
+            nodes = sync_favorite_snapshots_with_nodes()
+            try:
+                ip_cache = vpn_utils.load_ip_cache()
+            except Exception:
+                ip_cache = {}
+            for n in nodes:
+                ip_key = str(n.get("ip") or n.get("remote_host") or "").strip()
+                cached_entry = ip_cache.get(ip_key) if ip_key and isinstance(ip_cache, dict) else None
+                if isinstance(cached_entry, dict):
+                    for ck in vpn_utils.CLEANIP_NODE_FIELDS:
+                        if n.get(ck) in (None, "") and cached_entry.get(ck) not in (None, ""):
+                            n[ck] = cached_entry[ck]
             connection_state = get_state()
             connection_ready = connection_ready_for_ui(connection_state)
             active_node = next((n for n in nodes if connection_ready and n.get("id") == active_openvpn_node_id), None)
@@ -7060,6 +7814,10 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
+                    try:
+                        sync_favorite_snapshots_with_nodes(fav_ids=fav_ids)
+                    except Exception as sync_exc:
+                        print(f"[收藏快照] 同步收藏快照失败: {sync_exc}", flush=True)
 
                 policy_message = None
                 if ui_cfg.get("routing_mode") == "favorites":
@@ -7114,9 +7872,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 node_ids = [str(node_id or "").strip() for node_id in node_ids]
                 node_ids = [node_id for node_id in node_ids if node_id]
-                if len(node_ids) > MANUAL_TEST_NODE_LIMIT:
-                    self.send_json({"ok": False, "error": f"单次最多测试 {MANUAL_TEST_NODE_LIMIT} 个节点"}, HTTPStatus.BAD_REQUEST)
+                if not node_ids:
+                    self.send_json({"ok": False, "error": "请至少选择一个要检测的节点"}, HTTPStatus.BAD_REQUEST)
                     return
+                max_batch_limit = max(MANUAL_TEST_NODE_LIMIT, 200)
+                if len(node_ids) > max_batch_limit:
+                    node_ids = node_ids[:max_batch_limit]
                 if not maintenance_lock.acquire(blocking=False):
                     self.send_json({"ok": False, "error": "当前已有连接或节点维护任务正在运行，请稍后再试"}, HTTPStatus.CONFLICT)
                     return
@@ -7127,7 +7888,7 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     is_connecting = True
                 try:
-                    set_state(is_connecting=True, last_check_message="正在手动测试节点可用性...")
+                    set_state(is_connecting=True, last_check_message=f"正在批量测试 {len(node_ids)} 个节点可用性...")
                     tested_nodes = test_multiple_nodes(node_ids)
                     self.send_json({"ok": True, "nodes": tested_nodes})
                 finally:
@@ -7135,6 +7896,249 @@ class Handler(BaseHTTPRequestHandler):
                         is_connecting = False
                     set_state(is_connecting=False)
                     maintenance_lock.release()
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/test_nodes_batch":
+            try:
+                payload = self.read_json_body(max_bytes=262144)
+                raw_ids = payload.get("ids")
+                if raw_ids is None:
+                    raw_ids = payload.get("node_ids", [])
+                if not isinstance(raw_ids, list):
+                    self.send_json({"ok": False, "error": "节点 ID 列表无效"}, HTTPStatus.BAD_REQUEST)
+                    return
+                seen_batch: set[str] = set()
+                node_ids: list[str] = []
+                for item in raw_ids:
+                    nid = str(item or "").strip()
+                    if nid and nid not in seen_batch:
+                        seen_batch.add(nid)
+                        node_ids.append(nid)
+                if not node_ids:
+                    self.send_json({"ok": False, "error": "请先勾选要批量检测的节点"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if len(node_ids) > 200:
+                    node_ids = node_ids[:200]
+                if not maintenance_lock.acquire(blocking=False):
+                    self.send_json({"ok": False, "error": "当前已有连接或节点维护任务正在运行，请稍后再试"}, HTTPStatus.CONFLICT)
+                    return
+                global batch_test_running, batch_test_total, batch_test_completed
+                with lock:
+                    if is_connecting or batch_test_running:
+                        maintenance_lock.release()
+                        self.send_json({"ok": False, "error": "当前已有连接或批量检测任务正在运行，请稍后再试"}, HTTPStatus.CONFLICT)
+                        return
+                    is_connecting = True
+                    batch_test_running = True
+                    batch_test_total = len(node_ids)
+                    batch_test_completed = 0
+                    batch_test_cancel_event.clear()
+
+                def run_batch_probe(target_ids: list[str]) -> None:
+                    global is_connecting, batch_test_running, batch_test_total, batch_test_completed
+                    try:
+                        set_state(
+                            is_connecting=True,
+                            last_check_message=f"正在批量检测已选节点 (0/{len(target_ids)})...",
+                        )
+                        def on_progress(done: int, total: int, _res: dict[str, Any]) -> None:
+                            global batch_test_completed
+                            with lock:
+                                batch_test_completed = done
+                            set_state(
+                                last_check_message=f"正在批量检测已选节点 ({done}/{total})..."
+                            )
+                        results = test_multiple_nodes(
+                            target_ids,
+                            target_available=None,
+                            cancel_event=batch_test_cancel_event,
+                            progress_callback=on_progress,
+                        )
+                        avail_cnt = sum(1 for r in results if r.get("probe_status") == "available")
+                        cancelled = batch_test_cancel_event.is_set()
+                        summary_msg = (
+                            f"批量检测已停止：已测 {len(results)}/{len(target_ids)} 个节点，可用 {avail_cnt} 个"
+                            if cancelled
+                            else f"批量检测完成：共测 {len(results)} 个节点，可用 {avail_cnt} 个"
+                        )
+                        valid_total = len([n for n in read_nodes() if n.get("probe_status") == "available"])
+                        set_state(
+                            last_check_at=time.time(),
+                            last_check_message=summary_msg,
+                            valid_nodes=valid_total,
+                        )
+                    except Exception as batch_exc:
+                        log_to_json("ERROR", "VPN", f"批量检测节点异常: {batch_exc}")
+                        set_state(last_check_message=f"批量检测异常: {batch_exc}")
+                    finally:
+                        with lock:
+                            is_connecting = False
+                            batch_test_running = False
+                        set_state(is_connecting=False)
+                        maintenance_lock.release()
+
+                threading.Thread(target=run_batch_probe, args=(node_ids,), daemon=True).start()
+                self.send_json({
+                    "ok": True,
+                    "started": True,
+                    "total": len(node_ids),
+                    "message": f"已启动 {len(node_ids)} 个节点的并发可用性检测",
+                })
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/cancel_batch_test":
+            try:
+                self.read_request_body()
+                batch_test_cancel_event.set()
+                self.send_json({"ok": True, "message": "已发送停止批量检测指令"})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/check_cleanip":
+            try:
+                payload = self.read_json_body()
+                node_id = str(payload.get("id") or "").strip()
+                target_ip = str(payload.get("ip") or "").strip()
+                force_refresh = bool(payload.get("force"))
+                via_proxy_flag = bool(payload.get("via_proxy"))
+
+                node = None
+                if node_id:
+                    with lock:
+                        nodes = read_nodes()
+                        node = next((item for item in nodes if item.get("id") == node_id), None)
+                    if node and not target_ip:
+                        target_ip = str(node.get("ip") or node.get("remote_host") or "").strip()
+
+                proxy_url = None
+                use_cli = False
+                if via_proxy_flag:
+                    p_host = "127.0.0.1" if LOCAL_PROXY_HOST in ("::", "0.0.0.0", "") else LOCAL_PROXY_HOST
+                    if ":" in p_host and not p_host.startswith("["):
+                        p_host = f"[{p_host}]"
+                    proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
+                    use_cli = bool(payload.get("use_cli", True))
+                    if not target_ip:
+                        st = get_state()
+                        target_ip = str(st.get("proxy_ip") or "").strip()
+                        if target_ip == "-":
+                            target_ip = ""
+
+                result_data = vpn_utils.query_cleanip_for_ip(
+                    target_ip,
+                    force_refresh=force_refresh,
+                    via_proxy=proxy_url,
+                    use_cli_endpoint=use_cli,
+                )
+                resolved_ip = str(result_data.get("ip") or target_ip).strip()
+
+                updated_node = None
+                with lock:
+                    nodes = read_nodes()
+                    changed = False
+                    for item in nodes:
+                        item_ip = str(item.get("ip") or item.get("remote_host") or "").strip()
+                        if (node_id and item.get("id") == node_id) or (resolved_ip and item_ip == resolved_ip):
+                            for ck in vpn_utils.CLEANIP_NODE_FIELDS:
+                                if ck in result_data:
+                                    item[ck] = result_data[ck]
+                            changed = True
+                            if node_id and item.get("id") == node_id:
+                                updated_node = dict(item)
+                            elif updated_node is None:
+                                updated_node = dict(item)
+                    if changed:
+                        write_json(NODES_FILE, nodes)
+                        try:
+                            sync_favorite_snapshots_with_nodes(nodes=nodes)
+                        except Exception:
+                            pass
+                if updated_node and "config_text" in updated_node:
+                    del updated_node["config_text"]
+                self.send_json({
+                    "ok": True,
+                    "cleanip": result_data,
+                    "node": updated_node,
+                })
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/check_cleanip_batch":
+            try:
+                payload = self.read_json_body(max_bytes=262144)
+                raw_ids = payload.get("ids") or payload.get("node_ids") or []
+                force_refresh = bool(payload.get("force"))
+                if not isinstance(raw_ids, list):
+                    self.send_json({"ok": False, "error": "节点 ID 列表无效"}, HTTPStatus.BAD_REQUEST)
+                    return
+                target_ids = [str(x or "").strip() for x in raw_ids if str(x or "").strip()]
+                if not target_ids:
+                    self.send_json({"ok": False, "error": "请先勾选要检测纯净度的节点"}, HTTPStatus.BAD_REQUEST)
+                    return
+                target_ids = list(dict.fromkeys(target_ids))[:50]
+
+                global cleanip_batch_running, cleanip_batch_total, cleanip_batch_completed
+                with lock:
+                    if cleanip_batch_running:
+                        self.send_json({"ok": False, "error": "当前已有批量纯净度检测任务正在运行，请稍候"}, HTTPStatus.CONFLICT)
+                        return
+                    cleanip_batch_running = True
+                    cleanip_batch_total = len(target_ids)
+                    cleanip_batch_completed = 0
+
+                def run_cleanip_batch(ids_to_check: list[str], force_flag: bool) -> None:
+                    global cleanip_batch_running, cleanip_batch_total, cleanip_batch_completed
+                    try:
+                        with lock:
+                            nodes_snapshot = read_nodes()
+                            by_id = {str(n.get("id")): n for n in nodes_snapshot if n.get("id")}
+
+                        def check_one(nid: str) -> tuple[str, dict[str, Any] | None]:
+                            node_item = by_id.get(nid)
+                            if not node_item:
+                                return nid, None
+                            ip_addr = str(node_item.get("ip") or node_item.get("remote_host") or "").strip()
+                            if not ip_addr:
+                                return nid, None
+                            res = vpn_utils.query_cleanip_for_ip(ip_addr, force_refresh=force_flag)
+                            return nid, res
+
+                        max_workers = min(4, max(1, len(ids_to_check)))
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                            futures = {pool.submit(check_one, nid): nid for nid in ids_to_check}
+                            for fut in concurrent.futures.as_completed(futures):
+                                nid = futures[fut]
+                                try:
+                                    _, c_res = fut.result()
+                                except Exception as e:
+                                    print(f"[CleanIP Batch] 检测节点 {nid} 失败: {e}", flush=True)
+                                    c_res = None
+                                with lock:
+                                    cleanip_batch_completed += 1
+                                    if c_res:
+                                        curr_nodes = read_nodes()
+                                        c_ip = str(c_res.get("ip") or "").strip()
+                                        for item in curr_nodes:
+                                            item_ip = str(item.get("ip") or item.get("remote_host") or "").strip()
+                                            if item.get("id") == nid or (c_ip and item_ip == c_ip):
+                                                for ck in vpn_utils.CLEANIP_NODE_FIELDS:
+                                                    if ck in c_res:
+                                                        item[ck] = c_res[ck]
+                                        write_json(NODES_FILE, curr_nodes)
+                                        try:
+                                            sync_favorite_snapshots_with_nodes(nodes=curr_nodes)
+                                        except Exception:
+                                            pass
+                    finally:
+                        with lock:
+                            cleanip_batch_running = False
+                threading.Thread(target=run_cleanip_batch, args=(target_ids, force_refresh), daemon=True).start()
+                self.send_json({
+                    "ok": True,
+                    "started": True,
+                    "total": len(target_ids),
+                    "message": f"已在后台启动 {len(target_ids)} 个节点的 CleanIP 纯净度检测",
+                })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":

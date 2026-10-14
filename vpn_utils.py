@@ -443,6 +443,24 @@ def query_secondary_ip_type(ip: str) -> dict[str, Any] | None:
         print(f"[IP 类型] 第二情报源查询 {ip} 失败: {exc}", flush=True)
         return None
 
+CLEANIP_NODE_FIELDS = (
+    "cleanip_score",
+    "cleanip_grade",
+    "cleanip_env_score",
+    "cleanip_env_grade",
+    "cleanip_is_native",
+    "cleanip_native_label",
+    "cleanip_ip_type",
+    "cleanip_residential_prob",
+    "cleanip_risk_score",
+    "cleanip_risk_label",
+    "cleanip_ai_score",
+    "cleanip_summary",
+    "cleanip_report",
+    "cleanip_url",
+    "cleanip_checked_at",
+)
+
 def apply_ip_cache_entry(node: dict[str, Any], entry: dict[str, Any]) -> None:
     for key in (
         "owner",
@@ -459,7 +477,13 @@ def apply_ip_cache_entry(node: dict[str, Any], entry: dict[str, Any]) -> None:
         "ip_type_sources",
         "geo_country_short",
     ):
-        node[key] = entry.get(key, "")
+        if key in entry and entry.get(key) not in (None, ""):
+            node[key] = entry.get(key, "")
+        elif key not in node:
+            node[key] = entry.get(key, "")
+    for key in CLEANIP_NODE_FIELDS:
+        if key in entry and entry.get(key) not in (None, ""):
+            node[key] = entry.get(key)
 
 def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     # 1. Read cache thread-safely
@@ -599,7 +623,13 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     # 3. Save cache thread-safely (reload & update to avoid overwrite of concurrent queries)
     with ip_cache_lock:
         cache = load_ip_cache()
-        cache.update(new_entries)
+        for ip_key, new_entry in new_entries.items():
+            prev_entry = cache.get(ip_key)
+            if isinstance(prev_entry, dict):
+                for ck in CLEANIP_NODE_FIELDS:
+                    if ck in prev_entry and ck not in new_entry:
+                        new_entry[ck] = prev_entry[ck]
+            cache[ip_key] = new_entry
         save_ip_cache(cache)
 
     # 4. Enrich nodes with newly queried info
@@ -822,3 +852,377 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
                 pass
 
     return None
+
+
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_PATTERN.sub("", str(text or ""))
+
+def is_valid_ip_address(value: Any) -> bool:
+    import ipaddress
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+def _deref_nuxt_payload(data: list[Any], idx: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return None
+    if not isinstance(idx, int) or idx < 0 or idx >= len(data):
+        return idx
+    val = data[idx]
+    if isinstance(val, list):
+        if (
+            len(val) == 2
+            and isinstance(val[0], str)
+            and val[0] in ("ShallowReactive", "Reactive", "Ref", "EmptyRef", "EmptyShallowRef", "Set")
+        ):
+            return _deref_nuxt_payload(data, val[1], depth + 1)
+        return [_deref_nuxt_payload(data, item, depth + 1) for item in val[:30]]
+    if isinstance(val, dict):
+        return {str(k): _deref_nuxt_payload(data, v, depth + 1) for k, v in val.items()}
+    return val
+
+def format_cleanip_cli_report(info: dict[str, Any]) -> str:
+    ip = str(info.get("ip") or "-")
+    rdns = str(info.get("hostname") or "-")
+    location = str(info.get("location") or "-")
+    asn_str = str(info.get("asn_display") or "-")
+    net_type = str(info.get("cleanip_ip_type") or "-")
+    ip_type_zh = str(info.get("ip_type_label") or "-")
+    native_zh = str(info.get("cleanip_native_zh") or info.get("cleanip_native_label") or "-")
+    res_prob = info.get("cleanip_residential_prob")
+    res_prob_str = f"{res_prob}%" if isinstance(res_prob, (int, float)) else "-"
+    score = _safe_int(info.get("cleanip_score"), -1)
+    grade = str(info.get("cleanip_grade") or "-")
+    env_score = _safe_int(info.get("cleanip_env_score"), -1)
+    env_grade = str(info.get("cleanip_env_grade") or "-")
+    risk_score = _safe_int(info.get("cleanip_risk_score"), -1)
+    risk_label = str(info.get("cleanip_risk_label") or "未知")
+    ai_score = _safe_int(info.get("cleanip_ai_score"), -1)
+    recommendation = str(info.get("recommendation") or "")
+
+    filled = max(0, min(20, round(score / 5))) if score >= 0 else 0
+    bar = ("█" * filled) + ("░" * (20 - filled))
+    score_line = f"{bar} {score}/100 ({grade})" if score >= 0 else "未获取"
+    env_line = f"{env_score}/100 ({env_grade})" if env_score >= 0 else "-"
+    risk_line = f"{risk_score}/100 {risk_label}  ← 越低越好" if risk_score >= 0 else risk_label
+
+    lines = [
+        "  ██  CleanIP.io",
+        "        纯净度检测 · 风险评估 · 原生/住宅识别 · 黑名单监控",
+        "        IP Purity & Risk Intelligence",
+        "══════════════════════════════════════════════════════════════",
+        "",
+        f"  IP              {ip}",
+        f"  rDNS            {rdns}",
+        f"  归属地          {location}",
+        f"  运营商 / ASN    {asn_str}",
+        f"  网络类型        {net_type}",
+        f"  IP 类型         {ip_type_zh}",
+        f"  原生 / 广播     {native_zh}",
+        f"  住宅概率        {res_prob_str}",
+        "",
+        "──────────────────────────────────────────────────────────────",
+        f"  纯净度评分      {score_line}",
+        f"  综合可信度      {env_line}",
+        f"  风险评分        {risk_line}",
+    ]
+    if ai_score >= 0:
+        lines.append(f"  AI 订阅适配     {ai_score}/100")
+    platform_line = str(info.get("platform_summary") or "").strip()
+    if platform_line:
+        lines.append(f"  平台适配度      {platform_line}")
+    checks_line = str(info.get("checks_summary") or "").strip()
+    if checks_line:
+        lines.append(f"  风控检测项      {checks_line}")
+    if recommendation:
+        lines.append(f"  评估建议        {recommendation}")
+    lines.extend([
+        "──────────────────────────────────────────────────────────────",
+        "",
+        f"  完整报告 (含黑名单/端口/平台适配): https://cleanip.io/{ip}",
+    ])
+    return "\n".join(lines)
+
+def parse_cleanip_html_payload(html_text: str, target_ip: str) -> dict[str, Any]:
+    match = re.search(r'<script[^>]*id=["\']__NUXT_DATA__["\'][^>]*>(.*?)</script>', html_text, re.S)
+    if not match:
+        match = re.search(r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>', html_text, re.S)
+    if not match:
+        raise ValueError("CleanIP 页面未包含可解析的检测数据")
+
+    raw_data = json.loads(match.group(1))
+    if not isinstance(raw_data, list):
+        raise ValueError("CleanIP 数据结构格式异常")
+
+    q_key = f"q:{target_ip}"
+    ip_obj = None
+    for item in raw_data:
+        if isinstance(item, dict) and q_key in item and item[q_key] != -1:
+            resolved = _deref_nuxt_payload(raw_data, item[q_key])
+            if isinstance(resolved, dict) and isinstance(resolved.get("ip"), dict):
+                ip_obj = resolved["ip"]
+                break
+    if not ip_obj:
+        for item in raw_data:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    if str(k).startswith("q:") and v != -1:
+                        resolved = _deref_nuxt_payload(raw_data, v)
+                        if isinstance(resolved, dict) and isinstance(resolved.get("ip"), dict):
+                            ip_obj = resolved["ip"]
+                            break
+            if ip_obj:
+                break
+    if not ip_obj:
+        raise ValueError(f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情")
+
+    purity = ip_obj.get("purity") if isinstance(ip_obj.get("purity"), dict) else {}
+    env_obj = ip_obj.get("ip_environment") if isinstance(ip_obj.get("ip_environment"), dict) else {}
+    risk = ip_obj.get("risk") if isinstance(ip_obj.get("risk"), dict) else {}
+    network = ip_obj.get("network") if isinstance(ip_obj.get("network"), dict) else {}
+    geo = ip_obj.get("geo") if isinstance(ip_obj.get("geo"), dict) else {}
+    checks = ip_obj.get("checks") if isinstance(ip_obj.get("checks"), list) else []
+
+    score = _safe_int(purity.get("score"), 0)
+    grade = str(purity.get("grade") or "").strip().upper() or (
+        "A+" if score >= 95 else "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 50 else "D" if score >= 25 else "F"
+    )
+    env_score = _safe_int(env_obj.get("score"), score)
+    env_grade = str(env_obj.get("grade") or grade).strip().upper()
+
+    is_native = bool(purity.get("is_native")) or str(network.get("native_or_broadcast") or "").upper() == "NATIVE"
+    native_raw = str(purity.get("native_label") or network.get("native_or_broadcast") or "").strip()
+    if is_native or "native" in native_raw.lower():
+        native_zh = "原生 IP"
+        is_native = True
+    elif "broadcast" in native_raw.lower():
+        native_zh = "广播 IP"
+    else:
+        native_zh = native_raw or "未知"
+
+    cleanip_ip_type = str(purity.get("ip_type") or network.get("usage_type") or network.get("network_type") or "").strip()
+    if cleanip_ip_type.upper() in ("ISP", "RESIDENTIAL") or str(network.get("asn_type") or "").lower() == "isp":
+        ip_type_label = "住宅 IP"
+    elif cleanip_ip_type.upper() in ("IDC", "DCH", "HOSTING", "DATACENTER", "CDN"):
+        ip_type_label = "机房 IP"
+    elif "mobile" in cleanip_ip_type.lower():
+        ip_type_label = "移动 IP"
+    else:
+        ip_type_label = cleanip_ip_type or "未知"
+
+    res_prob = _safe_int(purity.get("residential_probability"), 0)
+    risk_score = _safe_int(risk.get("risk_score"), 0)
+    risk_label_raw = str(risk.get("risk_label") or risk.get("risk_level") or "").strip()
+    risk_label_map = {
+        "Clean": "低风险",
+        "Low": "低风险",
+        "Medium": "中风险",
+        "High": "高风险",
+        "Critical": "极高危",
+    }
+    risk_label = risk_label_map.get(risk_label_raw, risk_label_raw or ("低风险" if risk_score <= 25 else "中风险" if risk_score <= 60 else "高风险"))
+
+    platform_scores = purity.get("platform_scores") if isinstance(purity.get("platform_scores"), dict) else {}
+    ai_score = _safe_int(platform_scores.get("ai_subscription"), -1)
+    platform_parts = []
+    for pk, plabel in (("ai_subscription", "AI"), ("tiktok", "TikTok"), ("netflix", "流媒体"), ("youtube", "YouTube"), ("payment", "支付")):
+        if pk in platform_scores and platform_scores.get(pk) is not None:
+            platform_parts.append(f"{plabel} {platform_scores[pk]}")
+    platform_summary = " · ".join(platform_parts)
+
+    check_parts = []
+    for chk in checks:
+        if isinstance(chk, dict) and chk.get("label") and chk.get("verdict"):
+            status_icon = "✓" if chk.get("status") == "pass" else ("⚠" if chk.get("status") == "warn" else "✗")
+            check_parts.append(f"{status_icon}{chk['label']}:{chk['verdict']}")
+    checks_summary = " | ".join(check_parts)
+
+    loc_parts = [str(geo.get(k) or "").strip() for k in ("country", "region", "city")]
+    location_str = " · ".join([p for p in loc_parts if p]) or "-"
+    asn_num = network.get("asn")
+    asn_org = str(network.get("asn_name") or network.get("asn_org") or network.get("isp") or "").strip()
+    asn_display = f"AS{asn_num} {asn_org}".strip() if asn_num else (asn_org or "-")
+
+    summary_parts = [f"纯净度 {score} ({grade})"]
+    if env_score > 0:
+        summary_parts.append(f"综合 {env_score} ({env_grade})")
+    summary_parts.append(native_zh)
+    summary_parts.append(ip_type_label)
+    if res_prob > 0:
+        summary_parts.append(f"住宅率 {res_prob}%")
+    if ai_score >= 0:
+        summary_parts.append(f"AI适配 {ai_score}")
+    summary_str = " · ".join(summary_parts)
+
+    info_for_report = {
+        "ip": str(ip_obj.get("ip") or target_ip),
+        "hostname": str(ip_obj.get("hostname") or "-"),
+        "location": location_str,
+        "asn_display": asn_display,
+        "cleanip_ip_type": cleanip_ip_type or "-",
+        "ip_type_label": ip_type_label,
+        "cleanip_native_label": native_zh,
+        "cleanip_residential_prob": res_prob,
+        "cleanip_score": score,
+        "cleanip_grade": grade,
+        "cleanip_env_score": env_score,
+        "cleanip_env_grade": env_grade,
+        "cleanip_risk_score": risk_score,
+        "cleanip_risk_label": risk_label,
+        "cleanip_ai_score": ai_score,
+        "platform_summary": platform_summary,
+        "checks_summary": checks_summary,
+        "recommendation": str(purity.get("recommendation") or ""),
+    }
+    report_text = format_cleanip_cli_report(info_for_report)
+    now = time.time()
+    return {
+        "ip": str(ip_obj.get("ip") or target_ip),
+        "cleanip_score": score,
+        "cleanip_grade": grade,
+        "cleanip_env_score": env_score,
+        "cleanip_env_grade": env_grade,
+        "cleanip_is_native": is_native,
+        "cleanip_native_label": native_zh,
+        "cleanip_ip_type": cleanip_ip_type or ip_type_label,
+        "cleanip_residential_prob": res_prob,
+        "cleanip_risk_score": risk_score,
+        "cleanip_risk_label": risk_label,
+        "cleanip_ai_score": ai_score,
+        "cleanip_summary": summary_str,
+        "cleanip_report": report_text,
+        "cleanip_url": f"https://cleanip.io/{target_ip}",
+        "cleanip_checked_at": now,
+    }
+
+def parse_cleanip_cli_text(raw_text: str, fallback_ip: str = "") -> dict[str, Any]:
+    clean_text = strip_ansi(raw_text).strip()
+    if not clean_text or "命令行只支持查询本机出口" in clean_text:
+        raise ValueError(clean_text or "CleanIP CLI 返回为空")
+
+    ip_match = re.search(r"^\s*IP\s+([0-9a-fA-F:.]+)", clean_text, re.M)
+    ip = ip_match.group(1).strip() if ip_match else fallback_ip
+
+    score_match = re.search(r"纯净度评分.*?(\d{1,3})\s*/\s*100\s*\(([A-F]\+?)\)", clean_text)
+    score = int(score_match.group(1)) if score_match else 0
+    grade = score_match.group(2).strip().upper() if score_match else (
+        "A+" if score >= 95 else "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 50 else "D" if score >= 25 else "F"
+    )
+
+    risk_match = re.search(r"风险评分\s+(\d{1,3})\s*/\s*100\s*([^\n←]*)", clean_text)
+    risk_score = int(risk_match.group(1)) if risk_match else 0
+    risk_label = risk_match.group(2).strip() if risk_match else ""
+
+    native_match = re.search(r"原生\s*/\s*广播\s+([^\n]+)", clean_text)
+    native_label = native_match.group(1).strip() if native_match else "未知"
+    is_native = "原生" in native_label or "native" in native_label.lower()
+
+    ip_type_match = re.search(r"IP\s*类型\s+([^\n]+)", clean_text)
+    ip_type_label = ip_type_match.group(1).strip() if ip_type_match else ""
+
+    res_match = re.search(r"住宅概率\s+(\d{1,3})%", clean_text)
+    res_prob = int(res_match.group(1)) if res_match else 0
+
+    summary_parts = [f"纯净度 {score} ({grade})", native_label]
+    if ip_type_label:
+        summary_parts.append(ip_type_label)
+    if res_prob > 0:
+        summary_parts.append(f"住宅率 {res_prob}%")
+
+    return {
+        "ip": ip,
+        "cleanip_score": score,
+        "cleanip_grade": grade,
+        "cleanip_env_score": score,
+        "cleanip_env_grade": grade,
+        "cleanip_is_native": is_native,
+        "cleanip_native_label": native_label,
+        "cleanip_ip_type": ip_type_label,
+        "cleanip_residential_prob": res_prob,
+        "cleanip_risk_score": risk_score,
+        "cleanip_risk_label": risk_label,
+        "cleanip_ai_score": -1,
+        "cleanip_summary": " · ".join([p for p in summary_parts if p]),
+        "cleanip_report": clean_text,
+        "cleanip_url": f"https://cleanip.io/{ip}" if ip else "https://cleanip.io",
+        "cleanip_checked_at": time.time(),
+    }
+
+def query_cleanip_for_ip(
+    ip: str,
+    *,
+    force_refresh: bool = False,
+    via_proxy: str | None = None,
+    use_cli_endpoint: bool = False,
+) -> dict[str, Any]:
+    target_ip = str(ip or "").strip()
+    if not use_cli_endpoint and not is_valid_ip_address(target_ip):
+        raise ValueError(f"无效的 IP 地址: {target_ip}")
+
+    now = time.time()
+    if target_ip and not force_refresh and not use_cli_endpoint:
+        with ip_cache_lock:
+            cache = load_ip_cache()
+            cached = cache.get(target_ip)
+            if (
+                isinstance(cached, dict)
+                and cached.get("cleanip_score") not in (None, "")
+                and now - float(cached.get("cleanip_checked_at", 0) or 0) < IP_CACHE_TTL_SECONDS
+            ):
+                return {k: cached.get(k) for k in ("ip", *CLEANIP_NODE_FIELDS) if k in cached} | {"ip": target_ip, "cached": True}
+
+    curl_bin = "curl.exe" if os.name == "nt" else "curl"
+    result_data: dict[str, Any] | None = None
+
+    if use_cli_endpoint:
+        cmd = [curl_bin, "-sS", "-L", "--max-time", "14"]
+        if via_proxy:
+            cmd.extend(["-x", via_proxy])
+        cmd.append("https://cleanip.io/cli")
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=16)
+        if res.returncode == 0 and res.stdout.strip():
+            result_data = parse_cleanip_cli_text(res.stdout, fallback_ip=target_ip)
+            if not target_ip:
+                target_ip = str(result_data.get("ip") or "").strip()
+
+    if result_data is None:
+        if not is_valid_ip_address(target_ip):
+            raise RuntimeError("未能获取到有效的出口 IP 地址进行 CleanIP 查询")
+        url = f"https://cleanip.io/{urllib.parse.quote(target_ip)}"
+        cmd = [
+            curl_bin,
+            "-sS",
+            "-L",
+            "--max-time",
+            "15",
+            "-H",
+            "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
+            url,
+        ]
+        if via_proxy:
+            cmd.extend(["-x", via_proxy])
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
+        if res.returncode != 0 or not res.stdout.strip():
+            err_detail = (res.stderr or "").strip() or f"curl exit {res.returncode}"
+            raise RuntimeError(f"请求 CleanIP 失败: {err_detail}")
+        result_data = parse_cleanip_html_payload(res.stdout, target_ip)
+
+    if target_ip and is_valid_ip_address(target_ip):
+        with ip_cache_lock:
+            cache = load_ip_cache()
+            entry = cache.get(target_ip) if isinstance(cache.get(target_ip), dict) else {}
+            for k in CLEANIP_NODE_FIELDS:
+                if k in result_data:
+                    entry[k] = result_data[k]
+            entry.setdefault("cached_at", now)
+            cache[target_ip] = entry
+            save_ip_cache(cache)
+
+    return result_data
