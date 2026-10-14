@@ -364,7 +364,8 @@ def check_and_fix_dns() -> None:
         except Exception:
             pass
         finally:
-            if s is not None:\n                try:
+            if s is not None:
+                try:
                     s.close()
                 except Exception:
                     pass
