@@ -1105,6 +1105,38 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(92, restored_fav["cleanip_score"])
         self.assertFalse(restored_fav["in_latest_feed"])
 
+    def test_historical_favorites_reconstruct_from_disk_ovpn_and_ip_cache(self) -> None:
+        # Simulate a node that was favorited before upgrade:
+        # 1. Present in ui_auth.json favorite_node_ids
+        # 2. Not in nodes.json and not in favorites.json
+        # 3. Its .ovpn file is still in configs/ and its IP metadata is in ip_cache.json
+        old_id = "JP_198.51.100.200_1194_udp"
+        ovpn_path = manager.CONFIG_DIR / f"{old_id}.ovpn"
+        ovpn_path.write_text("client\ndev tun\nproto udp\nremote 198.51.100.200 1194 udp\n", encoding="utf-8")
+
+        manager.vpn_utils.save_ip_cache({
+            "198.51.100.200": {
+                "owner": "NTT PC Communications",
+                "location": "日本 东京都 东京",
+                "geo_country_short": "JP",
+                "ip_type": "residential",
+                "ip_type_confidence": "high",
+                "ip_type_sources": ["ip-api.com"],
+            }
+        })
+        ui_cfg = manager.load_ui_config()
+        ui_cfg["favorite_node_ids"] = [old_id]
+        manager.write_json(manager.DATA_DIR / "ui_auth.json", ui_cfg)
+        manager.write_json(manager.NODES_FILE, [])
+
+        restored_nodes = manager.sync_favorite_snapshots_with_nodes()
+        self.assertEqual(1, len(restored_nodes))
+        node = restored_nodes[0]
+        self.assertEqual(old_id, node["id"])
+        self.assertEqual("198.51.100.200", node["ip"])
+        self.assertEqual("NTT PC Communications", node["owner"])
+        self.assertEqual("residential", node["ip_type"])
+
     def test_batch_probe_tests_all_selected_nodes_when_target_available_is_none(self) -> None:
         nodes = self.write_nodes(8)
         selected_ids = [n["id"] for n in nodes[:7]]

@@ -518,6 +518,85 @@ def save_favorite_snapshots(snapshots: dict[str, dict[str, Any]]) -> None:
     }
     write_json(FAVORITES_FILE, cleaned)
 
+def reconstruct_favorite_node_from_disk(fid: str) -> dict[str, Any] | None:
+    fid = str(fid or "").strip()
+    if not fid:
+        return None
+    cfg_path = CONFIG_DIR / f"{fid}.ovpn"
+    config_text = ""
+    if cfg_path.exists():
+        try:
+            config_text = cfg_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            config_text = ""
+
+    parts = fid.split("_")
+    country_short = parts[0].upper() if parts and len(parts[0]) == 2 and parts[0].isalpha() else "XX"
+    proto = parts[-1].lower() if len(parts) >= 4 and parts[-1].lower() in ("tcp", "udp") else "udp"
+    port = parse_int(parts[-2]) if len(parts) >= 4 else 0
+    ip_guess = "_".join(parts[1:-2]) if len(parts) >= 4 else (parts[1] if len(parts) >= 2 else "")
+
+    if config_text:
+        remote_host, remote_port, parsed_proto = vpn_utils.parse_remote(config_text, ip_guess)
+        if remote_host:
+            ip_guess = remote_host
+        if remote_port:
+            port = remote_port
+        if parsed_proto and parsed_proto != "unknown":
+            proto = parsed_proto
+    elif not ip_guess:
+        return None
+
+    # Only reconstruct if we at least have the .ovpn config file on disk so OpenVPN can actually connect/test it
+    if not config_text:
+        return None
+
+    code_to_zh = {
+        "JP": "日本", "KR": "韩国", "US": "美国", "TW": "台湾", "HK": "香港",
+        "SG": "新加坡", "TH": "泰国", "VN": "越南", "GB": "英国", "DE": "德国",
+        "FR": "法国", "NL": "荷兰", "CA": "加拿大", "AU": "澳大利亚", "RU": "俄罗斯",
+        "IN": "印度", "MY": "马来西亚", "ID": "印度尼西亚", "PH": "菲律宾", "BR": "巴西",
+    }
+    country_zh = code_to_zh.get(country_short, country_short)
+
+    node: dict[str, Any] = {
+        "id": fid,
+        "country": country_zh,
+        "country_short": country_short,
+        "host_name": fid,
+        "ip": ip_guess,
+        "score": 100000,
+        "ping": 0,
+        "speed": 0,
+        "sessions": 0,
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+        "latency_ms": 0,
+        "config_file": str(cfg_path),
+        "config_text": config_text,
+        "proto": proto,
+        "remote_host": ip_guess,
+        "remote_port": port,
+        "fetched_at": time.time(),
+        "probe_status": "not_checked",
+        "probe_message": "已从本地历史配置文件恢复收藏节点",
+        "probed_at": 0,
+        "active": False,
+        "in_latest_feed": False,
+    }
+    try:
+        ip_cache = vpn_utils.load_ip_cache()
+        cached_entry = ip_cache.get(ip_guess) if isinstance(ip_cache, dict) else None
+        if isinstance(cached_entry, dict):
+            vpn_utils.apply_ip_cache_entry(node, cached_entry)
+    except Exception:
+        pass
+    return node
+
 def sync_favorite_snapshots_with_nodes(
     fav_ids: list[str] | None = None,
     nodes: list[dict[str, Any]] | None = None,
@@ -555,7 +634,12 @@ def sync_favorite_snapshots_with_nodes(
                 if snapshots.get(fid) != node_copy:
                     snapshots[fid] = node_copy
                     snapshots_changed = True
-            elif fid in snapshots:
+            elif fid in snapshots or reconstruct_favorite_node_from_disk(fid) is not None:
+                if fid not in snapshots:
+                    disk_node = reconstruct_favorite_node_from_disk(fid)
+                    if disk_node is not None:
+                        snapshots[fid] = disk_node
+                        snapshots_changed = True
                 restored = dict(snapshots[fid])
                 restored["active"] = bool(active_openvpn_node_id and restored.get("id") == active_openvpn_node_id)
                 config_file = restored.get("config_file") or str(CONFIG_DIR / f"{fid}.ovpn")
