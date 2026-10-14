@@ -1129,13 +1129,22 @@ class ManagerLogicTests(unittest.TestCase):
         manager.write_json(manager.DATA_DIR / "ui_auth.json", ui_cfg)
         manager.write_json(manager.NODES_FILE, [])
 
+        # Also include a second favorite whose .ovpn file was deleted by stop_active_openvpn()
+        deleted_ovpn_id = "JP_133.106.193.57_3040_udp"
+        ui_cfg = manager.load_ui_config()
+        ui_cfg["favorite_node_ids"] = [old_id, deleted_ovpn_id]
+        manager.write_json(manager.DATA_DIR / "ui_auth.json", ui_cfg)
+        manager._vpngate_cert_blocks_cache = "<ca>\nCA\n</ca>\n<cert>\nCERT\n</cert>\n<key>\nKEY\n</key>\n"
+
         restored_nodes = manager.sync_favorite_snapshots_with_nodes()
-        self.assertEqual(1, len(restored_nodes))
-        node = restored_nodes[0]
-        self.assertEqual(old_id, node["id"])
-        self.assertEqual("198.51.100.200", node["ip"])
-        self.assertEqual("NTT PC Communications", node["owner"])
-        self.assertEqual("residential", node["ip_type"])
+        self.assertEqual(2, len(restored_nodes))
+        by_id = {n["id"]: n for n in restored_nodes}
+        self.assertIn(old_id, by_id)
+        self.assertIn(deleted_ovpn_id, by_id)
+        self.assertEqual("133.106.193.57", by_id[deleted_ovpn_id]["ip"])
+        self.assertEqual(3040, by_id[deleted_ovpn_id]["remote_port"])
+        self.assertEqual("udp", by_id[deleted_ovpn_id]["proto"])
+        snapshot_utils.validate_openvpn_config(by_id[deleted_ovpn_id]["config_text"])
 
     def test_batch_probe_tests_all_selected_nodes_when_target_available_is_none(self) -> None:
         nodes = self.write_nodes(8)

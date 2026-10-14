@@ -518,7 +518,89 @@ def save_favorite_snapshots(snapshots: dict[str, dict[str, Any]]) -> None:
     }
     write_json(FAVORITES_FILE, cleaned)
 
-def reconstruct_favorite_node_from_disk(fid: str) -> dict[str, Any] | None:
+_vpngate_cert_blocks_cache: str | None = None
+
+def _extract_vpngate_cert_blocks(config_text: str) -> str | None:
+    if not config_text:
+        return None
+    ca_m = re.search(r"<ca>[\s\S]*?</ca>", config_text)
+    cert_m = re.search(r"<cert>[\s\S]*?</cert>", config_text)
+    key_m = re.search(r"<key>[\s\S]*?</key>", config_text)
+    if ca_m and cert_m and key_m:
+        return f"{ca_m.group(0)}\n{cert_m.group(0)}\n{key_m.group(0)}\n"
+    return None
+
+def get_standard_vpngate_cert_blocks(nodes: list[dict[str, Any]] | None = None) -> str | None:
+    global _vpngate_cert_blocks_cache
+    if _vpngate_cert_blocks_cache:
+        return _vpngate_cert_blocks_cache
+
+    # 1. Try existing nodes in memory/disk
+    for n in (nodes if nodes is not None else []):
+        blocks = _extract_vpngate_cert_blocks(str(n.get("config_text") or ""))
+        if blocks:
+            _vpngate_cert_blocks_cache = blocks
+            return blocks
+
+    # 2. Try any existing .ovpn file in CONFIG_DIR
+    try:
+        if CONFIG_DIR.exists():
+            for ovpn_file in CONFIG_DIR.glob("*.ovpn"):
+                if ovpn_file.name.startswith(".test_"):
+                    continue
+                blocks = _extract_vpngate_cert_blocks(ovpn_file.read_text(encoding="utf-8", errors="replace"))
+                if blocks:
+                    _vpngate_cert_blocks_cache = blocks
+                    return blocks
+    except Exception:
+        pass
+
+    # 3. Try local snapshot or bundled snapshot CSV
+    for csv_path in (API_CACHE_FILE, BUNDLED_SNAPSHOT_FILE):
+        try:
+            if csv_path.exists():
+                rows = snapshot_utils.parse_and_validate_snapshot(read_snapshot_file(csv_path), max_rows=5)
+                for row in rows:
+                    cfg = decode_config(row.get("OpenVPN_ConfigData_Base64", ""))
+                    blocks = _extract_vpngate_cert_blocks(cfg)
+                    if blocks:
+                        _vpngate_cert_blocks_cache = blocks
+                        return blocks
+        except Exception:
+            pass
+    return None
+
+def synthesize_vpngate_openvpn_config(
+    ip: str,
+    port: int,
+    proto: str,
+    nodes: list[dict[str, Any]] | None = None,
+) -> str:
+    proto_norm = "tcp" if str(proto or "").lower().startswith("tcp") else "udp"
+    port_num = int(port) if int(port or 0) > 0 else (443 if proto_norm == "tcp" else 1194)
+    cert_blocks = get_standard_vpngate_cert_blocks(nodes)
+    if not cert_blocks:
+        return ""
+    return (
+        "dev tun\n"
+        f"proto {proto_norm}\n"
+        f"remote {ip} {port_num}\n"
+        "cipher AES-128-CBC\n"
+        "data-ciphers AES-128-CBC\n"
+        "auth SHA1\n"
+        "resolv-retry infinite\n"
+        "nobind\n"
+        "persist-key\n"
+        "persist-tun\n"
+        "client\n"
+        "verb 3\n"
+        f"{cert_blocks}"
+    )
+
+def reconstruct_favorite_node_from_disk(
+    fid: str,
+    nodes: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     fid = str(fid or "").strip()
     if not fid:
         return None
@@ -544,10 +626,17 @@ def reconstruct_favorite_node_from_disk(fid: str) -> dict[str, Any] | None:
             port = remote_port
         if parsed_proto and parsed_proto != "unknown":
             proto = parsed_proto
-    elif not ip_guess:
+    elif ip_guess and port > 0:
+        config_text = synthesize_vpngate_openvpn_config(ip_guess, port, proto, nodes=nodes)
+        if config_text:
+            try:
+                CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+                cfg_path.write_text(config_text, encoding="utf-8")
+            except Exception:
+                pass
+    else:
         return None
 
-    # Only reconstruct if we at least have the .ovpn config file on disk so OpenVPN can actually connect/test it
     if not config_text:
         return None
 
@@ -634,9 +723,9 @@ def sync_favorite_snapshots_with_nodes(
                 if snapshots.get(fid) != node_copy:
                     snapshots[fid] = node_copy
                     snapshots_changed = True
-            elif fid in snapshots or reconstruct_favorite_node_from_disk(fid) is not None:
+            elif fid in snapshots or reconstruct_favorite_node_from_disk(fid, nodes=current_nodes) is not None:
                 if fid not in snapshots:
-                    disk_node = reconstruct_favorite_node_from_disk(fid)
+                    disk_node = reconstruct_favorite_node_from_disk(fid, nodes=current_nodes)
                     if disk_node is not None:
                         snapshots[fid] = disk_node
                         snapshots_changed = True
