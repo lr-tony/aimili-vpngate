@@ -317,7 +317,8 @@ def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
         if res.returncode == 0:
             match = re.search(r"time=([\d.]+)\s*ms", res.stdout)
             if match:
-                val = int(float(match.group(1)))\n                if val > 0:
+                val = int(float(match.group(1)))
+                if val > 0:
                     return val
     except Exception:
         pass
@@ -363,8 +364,7 @@ def check_and_fix_dns() -> None:
         except Exception:
             pass
         finally:
-            if s is not None:
-                try:
+            if s is not None:\n                try:
                     s.close()
                 except Exception:
                     pass
