@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,9 @@ IP_CLASSIFICATION_VERSION = 4
 IP_CACHE_TTL_SECONDS = 7 * 24 * 3600
 
 ip_cache_lock = threading.RLock()
+_cleanip_token_lock = threading.Lock()
+_cleanip_token_cache: tuple[str | None, float] = (None, 0.0)
+CLEANIP_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 physical_interface_lock = threading.Lock()
 physical_interface_cache: tuple[str | None, float] = (None, 0.0)
 
@@ -313,8 +317,7 @@ def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
         if res.returncode == 0:
             match = re.search(r"time=([\d.]+)\s*ms", res.stdout)
             if match:
-                val = int(float(match.group(1)))
-                if val > 0:
+                val = int(float(match.group(1)))\n                if val > 0:
                     return val
     except Exception:
         pass
@@ -950,37 +953,8 @@ def format_cleanip_cli_report(info: dict[str, Any]) -> str:
     ])
     return "\n".join(lines)
 
-def parse_cleanip_html_payload(html_text: str, target_ip: str) -> dict[str, Any]:
-    match = re.search(r'<script[^>]*id=["\']__NUXT_DATA__["\'][^>]*>(.*?)</script>', html_text, re.S)
-    if not match:
-        match = re.search(r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>', html_text, re.S)
-    if not match:
-        raise ValueError("CleanIP 页面未包含可解析的检测数据")
-
-    raw_data = json.loads(match.group(1))
-    if not isinstance(raw_data, list):
-        raise ValueError("CleanIP 数据结构格式异常")
-
-    q_key = f"q:{target_ip}"
-    ip_obj = None
-    for item in raw_data:
-        if isinstance(item, dict) and q_key in item and item[q_key] != -1:
-            resolved = _deref_nuxt_payload(raw_data, item[q_key])
-            if isinstance(resolved, dict) and isinstance(resolved.get("ip"), dict):
-                ip_obj = resolved["ip"]
-                break
-    if not ip_obj:
-        for item in raw_data:
-            if isinstance(item, dict):
-                for k, v in item.items():
-                    if str(k).startswith("q:") and v != -1:
-                        resolved = _deref_nuxt_payload(raw_data, v)
-                        if isinstance(resolved, dict) and isinstance(resolved.get("ip"), dict):
-                            ip_obj = resolved["ip"]
-                            break
-            if ip_obj:
-                break
-    if not ip_obj:
+def build_cleanip_result_from_ip_obj(ip_obj: dict[str, Any], target_ip: str) -> dict[str, Any]:
+    if not isinstance(ip_obj, dict) or not (ip_obj.get("purity") or ip_obj.get("ip")):
         raise ValueError(f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情")
 
     purity = ip_obj.get("purity") if isinstance(ip_obj.get("purity"), dict) else {}
@@ -1008,9 +982,9 @@ def parse_cleanip_html_payload(html_text: str, target_ip: str) -> dict[str, Any]
         native_zh = native_raw or "未知"
 
     cleanip_ip_type = str(purity.get("ip_type") or network.get("usage_type") or network.get("network_type") or "").strip()
-    if cleanip_ip_type.upper() in ("ISP", "RESIDENTIAL") or str(network.get("asn_type") or "").lower() == "isp":
+    if cleanip_ip_type.upper() in ("ISP", "RESIDENTIAL", "RESIDENTIAL IP") or "residential" in cleanip_ip_type.lower() or str(network.get("asn_type") or "").lower() == "isp":
         ip_type_label = "住宅 IP"
-    elif cleanip_ip_type.upper() in ("IDC", "DCH", "HOSTING", "DATACENTER", "CDN"):
+    elif cleanip_ip_type.upper() in ("IDC", "DCH", "HOSTING", "DATACENTER", "DATACENTER IP", "CDN") or "datacenter" in cleanip_ip_type.lower() or "hosting" in cleanip_ip_type.lower():
         ip_type_label = "机房 IP"
     elif "mobile" in cleanip_ip_type.lower():
         ip_type_label = "移动 IP"
@@ -1021,8 +995,10 @@ def parse_cleanip_html_payload(html_text: str, target_ip: str) -> dict[str, Any]
     risk_score = _safe_int(risk.get("risk_score"), 0)
     risk_label_raw = str(risk.get("risk_label") or risk.get("risk_level") or "").strip()
     risk_label_map = {
+        "Very Clean": "极低风险",
         "Clean": "低风险",
         "Low": "低风险",
+        "Minimal": "极低风险",
         "Medium": "中风险",
         "High": "高风险",
         "Critical": "极高危",
@@ -1101,6 +1077,173 @@ def parse_cleanip_html_payload(html_text: str, target_ip: str) -> dict[str, Any]
         "cleanip_url": f"https://cleanip.io/{target_ip}",
         "cleanip_checked_at": now,
     }
+
+def parse_cleanip_html_payload(html_text: str, target_ip: str) -> dict[str, Any]:
+    match = re.search(r'<script[^>]*id=["\']__NUXT_DATA__["\'][^>]*>(.*?)</script>', html_text, re.S)
+    if not match:
+        match = re.search(r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>', html_text, re.S)
+    if not match:
+        raise ValueError("CleanIP 页面未包含可解析的检测数据")
+
+    raw_data = json.loads(match.group(1))
+    if not isinstance(raw_data, list):
+        raise ValueError("CleanIP 数据结构格式异常")
+
+    q_key = f"q:{target_ip}"
+    ip_obj = None
+    for item in raw_data:
+        if isinstance(item, dict) and q_key in item and item[q_key] != -1:
+            resolved = _deref_nuxt_payload(raw_data, item[q_key])
+            if isinstance(resolved, dict) and isinstance(resolved.get("ip"), dict):
+                ip_obj = resolved["ip"]
+                break
+    if not ip_obj:
+        for item in raw_data:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    if str(k).startswith("q:") and v != -1:
+                        resolved = _deref_nuxt_payload(raw_data, v)
+                        if isinstance(resolved, dict) and isinstance(resolved.get("ip"), dict):
+                            ip_obj = resolved["ip"]
+                            break
+            if ip_obj:
+                break
+    if not ip_obj:
+        raise ValueError(f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情")
+
+    return build_cleanip_result_from_ip_obj(ip_obj, target_ip)
+
+def solve_cleanip_pow(seed: str, difficulty: int = 4, max_attempts: int = 2_000_000) -> str | None:
+    seed_str = str(seed or "").strip()
+    if not seed_str:
+        return None
+    diff = max(1, min(8, int(difficulty or 4)))
+    target_prefix = "0" * diff
+    prefix_bytes = f"{seed_str}:".encode("utf-8")
+    for nonce in range(max_attempts):
+        digest = hashlib.sha256(prefix_bytes + str(nonce).encode("ascii")).hexdigest()
+        if digest.startswith(target_prefix):
+            return str(nonce)
+    return None
+
+def get_cleanip_anti_bot_token(
+    *,
+    via_proxy: str | None = None,
+    force_new: bool = False,
+) -> str | None:
+    global _cleanip_token_cache
+    now_ms = time.time() * 1000.0
+    if not via_proxy and not force_new:
+        with _cleanip_token_lock:
+            cached_tok, cached_exp = _cleanip_token_cache
+            if cached_tok and cached_exp - now_ms > 30_000:
+                return cached_tok
+
+    curl_bin = "curl.exe" if os.name == "nt" else "curl"
+    ch_cmd = [
+        curl_bin,
+        "-sS",
+        "-L",
+        "--max-time",
+        "10",
+        "-A",
+        CLEANIP_BROWSER_UA,
+        "-H",
+        "Accept: application/json",
+        "https://cleanip.io/api/v2/challenge",
+    ]
+    if via_proxy:
+        ch_cmd.extend(["-x", via_proxy])
+    ch_res = subprocess.run(ch_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
+    if ch_res.returncode != 0 or not ch_res.stdout.strip():
+        return None
+    try:
+        ch_data = json.loads(ch_res.stdout)
+    except Exception:
+        return None
+    if not isinstance(ch_data, dict) or not ch_data.get("ok") or not ch_data.get("seed"):
+        return None
+
+    seed = str(ch_data["seed"])
+    difficulty = _safe_int(ch_data.get("difficulty"), 4)
+    nonce = solve_cleanip_pow(seed, difficulty)
+    if not nonce:
+        return None
+
+    tok_payload = json.dumps({"seed": seed, "nonce": nonce})
+    tok_cmd = [
+        curl_bin,
+        "-sS",
+        "-L",
+        "--max-time",
+        "10",
+        "-A",
+        CLEANIP_BROWSER_UA,
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        "Accept: application/json",
+        "-d",
+        tok_payload,
+        "https://cleanip.io/api/v2/token",
+    ]
+    if via_proxy:
+        tok_cmd.extend(["-x", via_proxy])
+    tok_res = subprocess.run(tok_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
+    if tok_res.returncode != 0 or not tok_res.stdout.strip():
+        return None
+    try:
+        tok_data = json.loads(tok_res.stdout)
+    except Exception:
+        return None
+    token = str(tok_data.get("token") or "").strip() if isinstance(tok_data, dict) and tok_data.get("ok") else ""
+    if not token:
+        return None
+    exp_ms = float(tok_data.get("exp") or (now_ms + 180_000))
+    if not via_proxy:
+        with _cleanip_token_lock:
+            _cleanip_token_cache = (token, exp_ms)
+    return token
+
+def query_cleanip_api_v2(
+    target_ip: str,
+    *,
+    via_proxy: str | None = None,
+) -> dict[str, Any]:
+    curl_bin = "curl.exe" if os.name == "nt" else "curl"
+    last_error = ""
+    for attempt in range(2):
+        token = get_cleanip_anti_bot_token(via_proxy=via_proxy, force_new=(attempt > 0))
+        headers = [
+            "-A",
+            CLEANIP_BROWSER_UA,
+            "-H",
+            "Accept: application/json",
+            "-H",
+            "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
+        ]
+        if token:
+            headers.extend(["-H", f"X-Anti-Bot-Token: {token}"])
+        api_url = f"https://cleanip.io/api/v2/{urllib.parse.quote(target_ip)}"
+        cmd = [curl_bin, "-sS", "-L", "--max-time", "15", *headers, api_url]
+        if via_proxy:
+            cmd.extend(["-x", via_proxy])
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
+        if res.returncode != 0 or not res.stdout.strip():
+            last_error = (res.stderr or "").strip() or f"curl exit {res.returncode}"
+            continue
+        try:
+            payload = json.loads(res.stdout)
+        except Exception as exc:
+            last_error = f"JSON 解析失败: {exc}"
+            continue
+        if isinstance(payload, dict) and payload.get("ok") and (payload.get("purity") or payload.get("ip")):
+            return build_cleanip_result_from_ip_obj(payload, target_ip)
+        err_msg = str(payload.get("error") or payload.get("message") or "").strip() if isinstance(payload, dict) else ""
+        last_error = err_msg or "API 未返回有效详情"
+    raise ValueError(f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情 ({last_error})" if last_error else f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情")
 
 def parse_cleanip_cli_text(raw_text: str, fallback_ip: str = "") -> dict[str, Any]:
     clean_text = strip_ansi(raw_text).strip()
@@ -1195,24 +1338,34 @@ def query_cleanip_for_ip(
     if result_data is None:
         if not is_valid_ip_address(target_ip):
             raise RuntimeError("未能获取到有效的出口 IP 地址进行 CleanIP 查询")
-        url = f"https://cleanip.io/{urllib.parse.quote(target_ip)}"
-        cmd = [
-            curl_bin,
-            "-sS",
-            "-L",
-            "--max-time",
-            "15",
-            "-H",
-            "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
-            url,
-        ]
-        if via_proxy:
-            cmd.extend(["-x", via_proxy])
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
-        if res.returncode != 0 or not res.stdout.strip():
-            err_detail = (res.stderr or "").strip() or f"curl exit {res.returncode}"
-            raise RuntimeError(f"请求 CleanIP 失败: {err_detail}")
-        result_data = parse_cleanip_html_payload(res.stdout, target_ip)
+        # 1. Prefer CleanIP API v2 with PoW anti-bot token (works reliably even when SSR HTML omits q:<ip>)
+        try:
+            result_data = query_cleanip_api_v2(target_ip, via_proxy=via_proxy)
+        except Exception:
+            result_data = None
+
+        # 2. Fallback to SSR HTML payload parsing
+        if result_data is None:
+            url = f"https://cleanip.io/{urllib.parse.quote(target_ip)}"
+            cmd = [
+                curl_bin,
+                "-sS",
+                "-L",
+                "--max-time",
+                "15",
+                "-A",
+                CLEANIP_BROWSER_UA,
+                "-H",
+                "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
+                url,
+            ]
+            if via_proxy:
+                cmd.extend(["-x", via_proxy])
+            res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
+            if res.returncode != 0 or not res.stdout.strip():
+                err_detail = (res.stderr or "").strip() or f"curl exit {res.returncode}"
+                raise RuntimeError(f"请求 CleanIP 失败: {err_detail}")
+            result_data = parse_cleanip_html_payload(res.stdout, target_ip)
 
     if target_ip and is_valid_ip_address(target_ip):
         with ip_cache_lock:
