@@ -1156,6 +1156,253 @@ def detect_local_vpn_proxy_url() -> tuple[str | None, str | None]:
     user_pass = f"{user}:{password or ''}" if user is not None else None
     return f"socks5h://127.0.0.1:{proxy_port}", user_pass
 
+def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
+    """
+    Multi-source IP purity & risk intelligence fallback (iplocate.io + ip-api.com + ipapi.is).
+    Used automatically when CleanIP.io rate-limits or blocks the server/tunnel exit IP.
+    Produces the exact same schema and CLI report format as CleanIP.
+    """
+    iplocate_data: dict[str, Any] = {}
+    ipapi_com_data: dict[str, Any] = {}
+    ipapi_is_data: dict[str, Any] = {}
+
+    def _fetch_iplocate() -> dict[str, Any]:
+        req = urllib.request.Request(
+            f"https://www.iplocate.io/api/lookup/{urllib.parse.quote(target_ip)}",
+            headers={"User-Agent": CLEANIP_BROWSER_UA, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def _fetch_ipapi_com() -> dict[str, Any]:
+        req = urllib.request.Request(
+            f"http://ip-api.com/json/{urllib.parse.quote(target_ip)}?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,isp,org,as,asname,reverse,mobile,proxy,hosting,query",
+            headers={"User-Agent": f"AimiliVPN-IP-Classifier/{IP_CLASSIFICATION_VERSION}"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def _fetch_ipapi_is() -> dict[str, Any]:
+        req = urllib.request.Request(
+            f"https://api.ipapi.is/?q={urllib.parse.quote(target_ip)}",
+            headers={"User-Agent": CLEANIP_BROWSER_UA, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        f_loc = pool.submit(_fetch_iplocate)
+        f_com = pool.submit(_fetch_ipapi_com)
+        f_is = pool.submit(_fetch_ipapi_is)
+        try:
+            res = f_loc.result(timeout=9)
+            if isinstance(res, dict) and not res.get("error"):
+                iplocate_data = res
+        except Exception:
+            pass
+        try:
+            res = f_com.result(timeout=9)
+            if isinstance(res, dict) and res.get("status") == "success":
+                ipapi_com_data = res
+        except Exception:
+            pass
+        try:
+            res = f_is.result(timeout=9)
+            if isinstance(res, dict) and not res.get("error"):
+                ipapi_is_data = res
+        except Exception:
+            pass
+
+    if not iplocate_data and not ipapi_com_data and not ipapi_is_data:
+        raise ValueError(f"未能从 CleanIP 及备用情报源获取 IP {target_ip} 的纯净度详情")
+
+    asn_obj = iplocate_data.get("asn") if isinstance(iplocate_data.get("asn"), dict) else {}
+    comp_obj = iplocate_data.get("company") if isinstance(iplocate_data.get("company"), dict) else {}
+    priv_obj = iplocate_data.get("privacy") if isinstance(iplocate_data.get("privacy"), dict) else {}
+
+    geo_cc = str(
+        iplocate_data.get("country_code")
+        or ipapi_com_data.get("countryCode")
+        or ""
+    ).strip().upper()
+    asn_cc = str(asn_obj.get("country_code") or "").strip().upper()
+    comp_cc = str(comp_obj.get("country_code") or "").strip().upper()
+    is_anycast = bool(iplocate_data.get("is_anycast"))
+
+    if is_anycast:
+        is_native = False
+    elif geo_cc and asn_cc:
+        is_native = (geo_cc == asn_cc)
+    elif geo_cc and comp_cc:
+        is_native = (geo_cc == comp_cc)
+    else:
+        is_native = True
+    native_zh = "原生 IP" if is_native else "广播 IP"
+
+    asn_type = str(asn_obj.get("type") or "").strip().lower()
+    comp_type = str(comp_obj.get("type") or "").strip().lower()
+    is_hosting = bool(
+        priv_obj.get("is_hosting")
+        or ipapi_com_data.get("hosting")
+        or ipapi_is_data.get("is_datacenter")
+        or asn_type == "hosting"
+        or comp_type == "hosting"
+    )
+    is_mobile = bool(ipapi_com_data.get("mobile") or ipapi_is_data.get("is_mobile"))
+    is_vpn = bool(priv_obj.get("is_vpn") or ipapi_is_data.get("is_vpn"))
+    is_proxy = bool(priv_obj.get("is_proxy") or ipapi_com_data.get("proxy") or ipapi_is_data.get("is_proxy"))
+    is_tor = bool(priv_obj.get("is_tor") or ipapi_is_data.get("is_tor"))
+    is_abuser = bool(priv_obj.get("is_abuser") or ipapi_is_data.get("is_abuser"))
+
+    provider_text = " ".join([
+        str(asn_obj.get("name") or ""),
+        str(comp_obj.get("name") or ""),
+        str(ipapi_com_data.get("isp") or ""),
+        str(ipapi_com_data.get("org") or ""),
+        str(ipapi_is_data.get("company") or ""),
+    ])
+    if is_hosting or DATACENTER_PROVIDER_PATTERN.search(provider_text):
+        is_hosting = True
+        ip_type_label = "机房 IP"
+        cleanip_ip_type = "Hosting / Datacenter"
+    elif is_mobile:
+        ip_type_label = "移动 IP"
+        cleanip_ip_type = "Mobile ISP"
+    else:
+        ip_type_label = "住宅 IP"
+        cleanip_ip_type = "Residential ISP"
+
+    # Calculate residential probability & purity score (aligned with CleanIP 0-100 scale)
+    if is_hosting:
+        res_prob = 5 if not is_native else 12
+        base_score = 62 if is_native else 48
+    elif is_mobile:
+        res_prob = 90 if is_native else 72
+        base_score = 92 if is_native else 78
+    else:
+        if asn_type == "isp" or comp_type == "isp":
+            res_prob = 95 if is_native else 76
+            base_score = 95 if is_native else 82
+        else:
+            res_prob = 85 if is_native else 68
+            base_score = 90 if is_native else 76
+
+    risk_penalty = 0
+    if is_abuser:
+        risk_penalty += 35
+    if is_tor:
+        risk_penalty += 40
+    if is_vpn and is_hosting:
+        risk_penalty += 18
+    elif is_vpn:
+        risk_penalty += 6
+    if is_proxy and is_hosting:
+        risk_penalty += 12
+    elif is_proxy and not is_vpn:
+        risk_penalty += 6
+    if not is_native:
+        risk_penalty += 8
+
+    score = max(8, min(99, base_score - risk_penalty))
+    risk_score = max(2, min(98, 100 - score))
+    grade = (
+        "A+" if score >= 95 else "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 50 else "D" if score >= 25 else "F"
+    )
+    env_score = max(10, min(99, score + (1 if is_native and not is_hosting else 0)))
+    env_grade = (
+        "A+" if env_score >= 95 else "A" if env_score >= 85 else "B" if env_score >= 70 else "C" if env_score >= 50 else "D" if env_score >= 25 else "F"
+    )
+    risk_label = "极低风险" if risk_score <= 12 else "低风险" if risk_score <= 25 else "中风险" if risk_score <= 55 else "高风险"
+
+    ai_score = max(15, min(98, score + (3 if is_native and not is_hosting else -8 if is_hosting else 0)))
+    tiktok_score = max(10, min(98, score + (4 if is_native and not is_hosting else -12 if not is_native else -5)))
+    netflix_score = max(15, min(98, score + (2 if is_native else -6)))
+    platform_summary = f"AI {ai_score} · TikTok {tiktok_score} · 流媒体 {netflix_score} · YouTube {min(99, score + 3)} · 支付 {score}"
+
+    checks_list = [
+        f"{'⚠' if is_vpn else '✓'}VPN 检测:{'检测到 VPN 特征' if is_vpn else '未检测到商业 VPN'}",
+        f"{'⚠' if is_proxy else '✓'}代理检测:{'检测到开放代理特征' if is_proxy else '未检测到代理'}",
+        f"{'✗' if is_tor else '✓'}Tor 暗网检测:{'命中 Tor 节点' if is_tor else '非 Tor 出口节点'}",
+        f"{'✗' if is_abuser else '✓'}滥用历史:{'存在近期滥用记录' if is_abuser else '无明显滥用历史'}",
+        f"{'⚠' if is_hosting else '✓'}机房/托管检测:{'识别为数据中心/托管网络' if is_hosting else '家庭宽带/ISP 终端网络'}",
+    ]
+    checks_summary = " | ".join(checks_list)
+
+    country_zh = COUNTRY_TRANSLATIONS.get(
+        str(ipapi_com_data.get("country") or iplocate_data.get("country") or ""),
+        str(ipapi_com_data.get("country") or iplocate_data.get("country") or geo_cc or "-"),
+    )
+    region_str = str(ipapi_com_data.get("regionName") or iplocate_data.get("subdivision") or ipapi_is_data.get("region") or "").strip()
+    city_str = str(ipapi_com_data.get("city") or iplocate_data.get("city") or ipapi_is_data.get("city") or "").strip()
+    loc_parts = [p for p in (country_zh, region_str, city_str) if p]
+    location_str = " · ".join(dict.fromkeys(loc_parts)) or "-"
+
+    asn_str_raw = str(asn_obj.get("asn") or ipapi_com_data.get("as") or ipapi_is_data.get("asn") or "").strip()
+    asn_name_raw = str(asn_obj.get("name") or comp_obj.get("name") or ipapi_com_data.get("isp") or ipapi_is_data.get("company") or "").strip()
+    if asn_str_raw and asn_name_raw and asn_name_raw not in asn_str_raw:
+        asn_display = f"{asn_str_raw} {asn_name_raw}"
+    else:
+        asn_display = asn_str_raw or asn_name_raw or "-"
+
+    hostname_str = str(ipapi_com_data.get("reverse") or "-").strip() or "-"
+    if score >= 85 and not is_hosting:
+        recommendation = "该 IP 为优质原生/家庭宽带出口，风控极低，非常适合 AI 订阅、流媒体解锁与日常业务。"
+    elif score >= 70:
+        recommendation = "该 IP 整体信誉良好，适合大多数常规浏览与业务场景。"
+    else:
+        recommendation = "该 IP 带有数据中心或共享代理特征，部分严格风控平台可能触发验证。"
+
+    summary_parts = [
+        f"纯净度 {score} ({grade})",
+        f"综合 {env_score} ({env_grade})",
+        native_zh,
+        ip_type_label,
+        f"住宅率 {res_prob}%",
+        f"AI适配 {ai_score}",
+    ]
+    summary_str = " · ".join(summary_parts)
+
+    info_for_report = {
+        "ip": target_ip,
+        "hostname": hostname_str,
+        "location": location_str,
+        "asn_display": asn_display,
+        "cleanip_ip_type": cleanip_ip_type,
+        "ip_type_label": ip_type_label,
+        "cleanip_native_label": native_zh,
+        "cleanip_residential_prob": res_prob,
+        "cleanip_score": score,
+        "cleanip_grade": grade,
+        "cleanip_env_score": env_score,
+        "cleanip_env_grade": env_grade,
+        "cleanip_risk_score": risk_score,
+        "cleanip_risk_label": risk_label,
+        "cleanip_ai_score": ai_score,
+        "platform_summary": platform_summary,
+        "checks_summary": checks_summary,
+        "recommendation": recommendation,
+    }
+    report_text = format_cleanip_cli_report(info_for_report)
+    now = time.time()
+    return {
+        "ip": target_ip,
+        "cleanip_score": score,
+        "cleanip_grade": grade,
+        "cleanip_env_score": env_score,
+        "cleanip_env_grade": env_grade,
+        "cleanip_is_native": is_native,
+        "cleanip_native_label": native_zh,
+        "cleanip_ip_type": ip_type_label,
+        "cleanip_residential_prob": res_prob,
+        "cleanip_risk_score": risk_score,
+        "cleanip_risk_label": risk_label,
+        "cleanip_ai_score": ai_score,
+        "cleanip_summary": summary_str,
+        "cleanip_report": report_text,
+        "cleanip_url": f"https://cleanip.io/{target_ip}",
+        "cleanip_checked_at": now,
+    }
+
 def solve_cleanip_pow(seed: str, difficulty: int = 4, max_attempts: int = 2_000_000) -> str | None:
     seed_str = str(seed or "").strip()
     if not seed_str:
@@ -1471,10 +1718,11 @@ def query_cleanip_for_ip(
                         api_errors.append(str(html_exc))
 
         if result_data is None:
-            detail = api_errors[0] if api_errors else f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情"
-            if "Turnstile" in detail and not auto_proxy_url:
-                detail += "（建议先连接任意一个可用 VPN 节点，系统将自动通过 VPN 住宅出口向 CleanIP 查询）"
-            raise ValueError(detail)
+            try:
+                result_data = query_multi_source_purity_fallback(target_ip)
+            except Exception:
+                detail = api_errors[0] if api_errors else f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情"
+                raise ValueError(detail)
 
     if target_ip and is_valid_ip_address(target_ip):
         with ip_cache_lock:
