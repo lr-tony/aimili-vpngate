@@ -211,6 +211,7 @@ IP_ENRICHMENT_FIELDS = (
     "ip_type_sources",
     "geo_country_short",
     *vpn_utils.CLEANIP_NODE_FIELDS,
+    *vpn_utils.INTEL_NODE_FIELDS,
 )
 
 class ConnectionCancelled(RuntimeError):
@@ -4591,6 +4592,23 @@ INDEX_HTML = r"""<!doctype html>
       color: #e0f2fe;
       border-color: rgba(56, 189, 248, 0.65);
     }
+    .intel-btn {
+      background: transparent;
+      color: #a78bfa;
+      border: 1px solid rgba(167, 139, 250, 0.45);
+      border-radius: 6px;
+      padding: 0 8px;
+      height: 30px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .intel-btn:hover:not(:disabled) {
+      background: rgba(167, 139, 250, 0.18);
+      color: #ede9fe;
+      border-color: rgba(167, 139, 250, 0.72);
+    }
 
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -4742,7 +4760,8 @@ INDEX_HTML = r"""<!doctype html>
         <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
           <button type="button" class="batch-mini-btn" onclick="selectFavoriteNodes()">全选收藏节点</button>
           <button type="button" class="test-btn" style="height: 32px; padding: 0 12px;" onclick="batchTestFavorites()">⚡ 一键检测全部收藏可用性</button>
-          <button type="button" class="cleanip-btn" style="height: 32px; padding: 0 12px;" onclick="batchCheckFavoritesCleanIp()">🛡️ 一键检测全部收藏纯净度</button>
+          <button type="button" class="cleanip-btn" style="height: 32px; padding: 0 12px;" onclick="batchCheckFavoritesCleanIp()">🛡️ 一键检测全部收藏 CleanIP</button>
+          <button type="button" class="intel-btn" style="height: 32px; padding: 0 12px;" onclick="batchCheckFavoritesIntel()">🔍 一键三源对比全部收藏</button>
         </div>
         <div style="padding: 10px 14px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 8px; font-size: 12px; color: var(--warning); line-height: 1.5;">
           <strong>收藏节点已启用防丢持久化保护：</strong>刷新节点列表或订阅源更新后，已收藏节点会自动保留在列表中，不会丢失。<br>
@@ -4770,7 +4789,10 @@ INDEX_HTML = r"""<!doctype html>
         ⏹ 停止检测
       </button>
       <button id="btn_batch_cleanip" type="button" class="cleanip-btn" style="height: 34px; padding: 0 14px; font-size: 12px;" onclick="runBatchCleanIpCheck()">
-        🛡️ 批量检测纯净度
+        🛡️ 批量检测 CleanIP
+      </button>
+      <button id="btn_batch_intel" type="button" class="intel-btn" style="height: 34px; padding: 0 14px; font-size: 12px;" onclick="runBatchIntelCheck()">
+        🔍 批量三源对比
       </button>
     </div>
   </section>
@@ -5118,6 +5140,7 @@ INDEX_HTML = r"""<!doctype html>
         <div style="display: flex; gap: 8px; flex-wrap: wrap;">
           <button type="button" onclick="copyCleanIpReport()" class="btn-primary" style="height: 36px; padding: 0 14px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">一键复制报告</button>
           <button id="btn_refresh_cleanip_modal" type="button" onclick="refreshCurrentCleanIpModal()" class="cleanip-btn" style="height: 36px; padding: 0 14px;">🔄 重新实时检测</button>
+          <button id="btn_switch_source_modal" type="button" onclick="switchCleanIpModalSource()" class="intel-btn" style="height: 36px; padding: 0 14px;">🔍 切换三源对比报告</button>
         </div>
         <button type="button" onclick="closeCleanIpModal()" style="height: 36px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
       </div>
@@ -5128,7 +5151,8 @@ INDEX_HTML = r"""<!doctype html>
 let nodes=[], state={}, testingNodeIds = new Set();
 const selectedNodeIds = new Set();
 const cleanIpTestingIds = new Set();
-let currentCleanIpContext = { nodeId: "", ip: "", viaProxy: false };
+const intelTestingIds = new Set();
+let currentCleanIpContext = { nodeId: "", ip: "", viaProxy: false, source: "cleanip" };
 const favoriteRequestIds = new Set();
 let disconnectInFlight = false;
 let currentPage = 1;
@@ -5378,19 +5402,39 @@ function getCleanIpGradeClass(grade, score) {
 
 function renderNodeCleanIpBadge(node) {
   if (!node) return "";
-  const isChecking = cleanIpTestingIds.has(node.id);
-  if (isChecking) {
-    return `<span class="cleanip-badge cleanip-grade-b" style="margin-top:4px;">检测中...</span>`;
+  const parts = [];
+  const isCheckingClean = cleanIpTestingIds.has(node.id);
+  if (isCheckingClean) {
+    parts.push(`<span class="cleanip-badge cleanip-grade-b" style="margin-top:4px;">🛡️ CleanIP检测中...</span>`);
+  } else {
+    const hasClean = node.cleanip_score !== undefined && node.cleanip_score !== null && node.cleanip_score !== "";
+    if (hasClean) {
+      const score = Number(node.cleanip_score);
+      const grade = String(node.cleanip_grade || "B");
+      const nativeShort = node.cleanip_is_native ? "原生" : (String(node.cleanip_native_label || "").includes("广播") ? "广播" : "");
+      const badgeClass = getCleanIpGradeClass(grade, score);
+      const summaryTitle = node.cleanip_summary || `CleanIP 纯净度: ${score}/100 (${grade})`;
+      const labelText = `CleanIP ${grade} ${score}${nativeShort ? "·" + nativeShort : ""}`;
+      parts.push(`<button type="button" class="cleanip-badge ${badgeClass}" style="margin-top: 4px;" title="${esc(summaryTitle)}（点击查看 CleanIP 报告）" onclick="openNodeCleanIpModal('${esc(node.id)}', event, 'cleanip')">🛡️ ${esc(labelText)}</button>`);
+    }
   }
-  const hasScore = node.cleanip_score !== undefined && node.cleanip_score !== null && node.cleanip_score !== "";
-  if (!hasScore) return "";
-  const score = Number(node.cleanip_score);
-  const grade = String(node.cleanip_grade || "B");
-  const nativeShort = node.cleanip_is_native ? "原生" : (String(node.cleanip_native_label || "").includes("广播") ? "广播" : "");
-  const badgeClass = getCleanIpGradeClass(grade, score);
-  const summaryTitle = node.cleanip_summary || `纯净度: ${score}/100 (${grade})`;
-  const labelText = `${grade} ${score}分${nativeShort ? "·" + nativeShort : ""}`;
-  return `<button type="button" class="cleanip-badge ${badgeClass}" style="margin-top: 4px;" title="${esc(summaryTitle)}（点击查看完整 CleanIP 报告）" onclick="openNodeCleanIpModal('${esc(node.id)}', event)">🛡️ ${esc(labelText)}</button>`;
+
+  const isCheckingIntel = intelTestingIds.has(node.id);
+  if (isCheckingIntel) {
+    parts.push(`<span class="cleanip-badge cleanip-grade-b" style="margin-top:4px; border-color:rgba(167,139,250,0.45); color:#c4b5fd;">🔍 三源检测中...</span>`);
+  } else {
+    const hasIntel = node.intel_score !== undefined && node.intel_score !== null && node.intel_score !== "";
+    if (hasIntel) {
+      const iScore = Number(node.intel_score);
+      const iGrade = String(node.intel_grade || "B");
+      const iNative = node.intel_is_native ? "原生" : (String(node.intel_native_label || "").includes("广播") ? "广播" : "");
+      const iClass = getCleanIpGradeClass(iGrade, iScore);
+      const iTitle = node.intel_summary || `三源评估: ${iScore}/100 (${iGrade})`;
+      const iLabel = `三源 ${iGrade} ${iScore}${iNative ? "·" + iNative : ""}`;
+      parts.push(`<button type="button" class="cleanip-badge ${iClass}" style="margin-top: 4px;" title="${esc(iTitle)}（点击查看三源对比报告）" onclick="openNodeCleanIpModal('${esc(node.id)}', event, 'intel')">🔍 ${esc(iLabel)}</button>`);
+    }
+  }
+  return parts.join("");
 }
 
 function syncDiscoveryCountriesFromState() {
@@ -5607,9 +5651,12 @@ function render(){
           </div>
         </div>
         <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-          ${activeNode.cleanip_score !== undefined && activeNode.cleanip_score !== "" ? renderNodeCleanIpBadge(activeNode) : ""}
-          <button type="button" class="cleanip-btn" style="height: 38px; padding: 0 14px; border-radius: 8px;" onclick="checkActiveExitCleanIp(event)">
-            🛡️ 检测出口纯净度
+          ${renderNodeCleanIpBadge(activeNode)}
+          <button type="button" class="cleanip-btn" style="height: 38px; padding: 0 12px; border-radius: 8px;" onclick="checkActiveExitCleanIp(event, 'cleanip')" title="直接由 VPS 本机查询该出口 IP 的 CleanIP 报告（不经过家宽隧道）">
+            🛡️ CleanIP检测
+          </button>
+          <button type="button" class="intel-btn" style="height: 38px; padding: 0 12px; border-radius: 8px;" onclick="checkActiveExitCleanIp(event, 'intel')" title="查询三源风控情报库 (iplocate.io + ip-api.com + ipapi.is) 对比报告">
+            🔍 三源对比
           </button>
           <button class="btn-danger" ${disconnectInFlight ? "disabled" : ""} style="height: 38px; padding: 0 16px; border-radius: 8px;" onclick="disconnectNode()">
             <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -5754,9 +5801,12 @@ function render(){
 
       const isChecked = selectedNodeIds.has(n.id);
       const isCleanIpChecking = cleanIpTestingIds.has(n.id);
+      const isIntelChecking = intelTestingIds.has(n.id);
       const cleanIpBadgeHtml = renderNodeCleanIpBadge(n);
-      const cleanIpBtnText = isCleanIpChecking ? "查询中" : (n.cleanip_score !== undefined && n.cleanip_score !== "" ? "报告" : "纯净度");
-      const cleanIpBtn = `<button class="cleanip-btn" ${isCleanIpChecking ? "disabled" : ""} onclick="openNodeCleanIpModal('${esc(n.id)}', event)" title="连接前免切换直接检测该节点 IP 的 CleanIP 纯净度与风控详情">${cleanIpBtnText}</button>`;
+      const cleanIpBtnText = isCleanIpChecking ? "查询中" : (n.cleanip_score !== undefined && n.cleanip_score !== "" ? "CleanIP" : "纯净度");
+      const cleanIpBtn = `<button class="cleanip-btn" ${isCleanIpChecking ? "disabled" : ""} onclick="openNodeCleanIpModal('${esc(n.id)}', event, 'cleanip')" title="由 VPS 本机直连查询 CleanIP 纯净度（不消耗家宽出口）">${cleanIpBtnText}</button>`;
+      const intelBtnText = isIntelChecking ? "对比中" : "三源对比";
+      const intelBtn = `<button class="intel-btn" ${isIntelChecking ? "disabled" : ""} onclick="openNodeCleanIpModal('${esc(n.id)}', event, 'intel')" title="独立查询 iplocate.io + ip-api.com + ipapi.is 三大情报库并与 CleanIP 对比">${intelBtnText}</button>`;
       const cachedFavHint = (isFav && n.in_latest_feed === false) ? `<span style="font-size:10px; color:var(--warning); margin-left:4px;" title="该收藏节点暂未出现在最新公共广播中，已由本地收藏快照永久保活">★保活</span>` : "";
 
       return `<tr ${rowClass}>
@@ -5780,6 +5830,7 @@ function render(){
           <div class="table-actions">
             ${testBtn}
             ${cleanIpBtn}
+            ${intelBtn}
             ${favBtn}
             ${connectBtn}
           </div>
@@ -5892,6 +5943,7 @@ function updateBatchSelectionUI() {
   const batchTestBtn = $("btn_batch_test");
   const cancelBatchBtn = $("btn_cancel_batch_test");
   const batchCleanBtn = $("btn_batch_cleanip");
+  const batchIntelBtn = $("btn_batch_intel");
   const isBatchTesting = Boolean(state && state.batch_test_running);
   const isCleanIpBatch = Boolean(state && state.cleanip_batch_running);
 
@@ -5916,12 +5968,25 @@ function updateBatchSelectionUI() {
       const done = state.cleanip_batch_completed || 0;
       const total = state.cleanip_batch_total || 0;
       batchCleanBtn.disabled = true;
-      batchCleanBtn.textContent = `🛡️ 纯净度检测中 (${done}/${total})`;
+      batchCleanBtn.textContent = `🛡️ 检测中 (${done}/${total})`;
     } else {
       batchCleanBtn.disabled = false;
       batchCleanBtn.textContent = selectedNodeIds.size > 0
-        ? `🛡️ 批量测纯净度 (${selectedNodeIds.size})`
-        : "🛡️ 批量测本页纯净度";
+        ? `🛡️ 批量 CleanIP (${selectedNodeIds.size})`
+        : "🛡️ 批量本页 CleanIP";
+    }
+  }
+  if (batchIntelBtn) {
+    if (isCleanIpBatch) {
+      const done = state.cleanip_batch_completed || 0;
+      const total = state.cleanip_batch_total || 0;
+      batchIntelBtn.disabled = true;
+      batchIntelBtn.textContent = `🔍 对比中 (${done}/${total})`;
+    } else {
+      batchIntelBtn.disabled = false;
+      batchIntelBtn.textContent = selectedNodeIds.size > 0
+        ? `🔍 批量三源对比 (${selectedNodeIds.size})`
+        : "🔍 批量本页三源对比";
     }
   }
 }
@@ -6034,30 +6099,35 @@ async function cancelBatchAvailabilityTest() {
   }
 }
 
-async function startBatchCleanIpWithIds(targetIds) {
+async function startBatchCleanIpWithIds(targetIds, source = "cleanip") {
   if (!targetIds || !targetIds.length) {
-    alert("请先勾选要检测纯净度的节点。");
+    alert("请先勾选要检测的节点。");
     return;
   }
   try {
     const response = await fetchWithTimeout("./api/check_cleanip_batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: targetIds })
+      body: JSON.stringify({ ids: targetIds, source: source })
     }, 25000);
-    const result = await readJsonResponse(response, "启动批量纯净度检测失败");
+    const result = await readJsonResponse(response, "启动批量检测失败");
     if (result.ok) {
       await load();
       startCleanIpBatchPolling();
     }
   } catch (e) {
-    alert("启动批量纯净度检测失败: " + (e.message || "未知错误"));
+    alert("启动批量检测失败: " + (e.message || "未知错误"));
   }
 }
 
 async function runBatchCleanIpCheck() {
   const ids = getEffectiveTargetNodeIds(10);
-  await startBatchCleanIpWithIds(ids);
+  await startBatchCleanIpWithIds(ids, "cleanip");
+}
+
+async function runBatchIntelCheck() {
+  const ids = getEffectiveTargetNodeIds(15);
+  await startBatchCleanIpWithIds(ids, "intel");
 }
 
 async function batchCheckFavoritesCleanIp() {
@@ -6068,7 +6138,18 @@ async function batchCheckFavoritesCleanIp() {
   }
   favIds.forEach(id => selectedNodeIds.add(id));
   render();
-  await startBatchCleanIpWithIds(favIds);
+  await startBatchCleanIpWithIds(favIds, "cleanip");
+}
+
+async function batchCheckFavoritesIntel() {
+  const favIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
+  if (!favIds.length) {
+    alert("您还没有收藏任何节点。");
+    return;
+  }
+  favIds.forEach(id => selectedNodeIds.add(id));
+  render();
+  await startBatchCleanIpWithIds(favIds, "intel");
 }
 
 let cleanIpPollInterval = null;
@@ -6098,33 +6179,63 @@ function closeCleanIpModal() {
   hideModal("cleanip_modal");
 }
 
-function renderCleanIpModalContent(info) {
+function updateCleanIpModalHeader(source) {
+  const titleEl = $("cleanip_modal_title");
+  const switchBtn = $("btn_switch_source_modal");
+  if (titleEl) {
+    titleEl.textContent = source === "intel"
+      ? "🔍 三源风控情报库对比报告 (iplocate.io + ip-api.com + ipapi.is)"
+      : "🛡️ CleanIP.io 纯净度与风控检测报告 (VPS本机直连)";
+  }
+  if (switchBtn) {
+    switchBtn.textContent = source === "intel"
+      ? "🛡️ 切换 CleanIP 官方报告"
+      : "🔍 切换三源对比报告";
+  }
+}
+
+function renderCleanIpModalContent(info, source = "cleanip") {
   const summaryEl = $("cleanip_summary_text");
   const linkEl = $("cleanip_external_link");
   const termEl = $("cleanip_terminal_container");
+  updateCleanIpModalHeader(source);
   if (!info) return;
+  const isIntel = source === "intel";
+  const summaryVal = isIntel
+    ? (info.intel_summary || info.cleanip_summary || `IP: ${info.ip || "-"} · 三源评分: ${info.intel_score ?? info.cleanip_score ?? "-"}/100`)
+    : (info.cleanip_summary || `IP: ${info.ip || "-"} · 纯净度: ${info.cleanip_score ?? "-"}/100 (${info.cleanip_grade || "-"})`);
+  const reportVal = isIntel
+    ? (info.intel_report || info.cleanip_report || "暂无三源详细报告内容。")
+    : (info.cleanip_report || "暂无详细报告内容。");
   if (summaryEl) {
-    summaryEl.textContent = info.cleanip_summary || `IP: ${info.ip || "-"} · 纯净度: ${info.cleanip_score ?? "-"}/100 (${info.cleanip_grade || "-"})`;
+    summaryEl.textContent = summaryVal;
   }
   if (linkEl) {
     linkEl.href = info.cleanip_url || (info.ip ? `https://cleanip.io/${encodeURIComponent(info.ip)}` : "https://cleanip.io");
   }
   if (termEl) {
-    termEl.textContent = info.cleanip_report || "暂无详细报告内容。";
+    termEl.textContent = reportVal;
   }
 }
 
 async function requestCleanIp(options = {}) {
-  const { nodeId = "", ip = "", force = false, viaProxy = false, useCli = false } = options;
-  currentCleanIpContext = { nodeId, ip, viaProxy, useCli };
+  const { nodeId = "", ip = "", force = false, source = "cleanip" } = options;
+  currentCleanIpContext = { nodeId, ip, viaProxy: false, useCli: false, source };
+  updateCleanIpModalHeader(source);
   const summaryEl = $("cleanip_summary_text");
   const termEl = $("cleanip_terminal_container");
   const refreshBtn = $("btn_refresh_cleanip_modal");
-  if (summaryEl) summaryEl.textContent = "正在实时查询 CleanIP.io 多源风控与纯净度数据...";
-  if (termEl) termEl.textContent = "正在向 CleanIP.io 发起请求并解析 6 维纯净度、原生/广播属性与 AI/流媒体平台适配度，请稍候 (约 2~5 秒)...";
+  if (source === "intel") {
+    if (summaryEl) summaryEl.textContent = "正在并发查询三大独立风控情报库 (iplocate.io + ip-api.com + ipapi.is)...";
+    if (termEl) termEl.textContent = "正在并发请求 iplocate.io (ASN注册国/原生广播/Privacy)、ip-api.com (rDNS/ISP/Hosting) 与 ipapi.is (滥用记录/数据中心)，不经过家宽隧道，请稍候 (约 1~3 秒)...";
+  } else {
+    if (summaryEl) summaryEl.textContent = "正在由 VPS 本机直接查询 CleanIP.io 数据（已禁用家宽隧道访问以保护家宽 IP）...";
+    if (termEl) termEl.textContent = "正在由 VPS 本机直连 CleanIP.io 解析 6 维纯净度、原生/广播属性与 AI/流媒体平台适配度（绝不经过您的家宽 VPN 隧道），请稍候...";
+  }
   if (refreshBtn) refreshBtn.disabled = true;
   if (nodeId) {
-    cleanIpTestingIds.add(nodeId);
+    if (source === "intel") intelTestingIds.add(nodeId);
+    else cleanIpTestingIds.add(nodeId);
     render();
   }
   try {
@@ -6135,51 +6246,61 @@ async function requestCleanIp(options = {}) {
         id: nodeId,
         ip: ip,
         force: force,
-        via_proxy: viaProxy,
-        use_cli: useCli
+        via_proxy: false,
+        use_cli: false,
+        source: source
       })
     }, 35000);
-    const result = await readJsonResponse(response, "CleanIP 纯净度检测失败");
+    const result = await readJsonResponse(response, source === "intel" ? "三源情报对比检测失败" : "CleanIP 纯净度检测失败");
     if (result.ok && result.cleanip) {
       if (result.node && nodeId) {
         const idx = nodes.findIndex(n => n && n.id === nodeId);
         if (idx !== -1) nodes[idx] = result.node;
       }
-      renderCleanIpModalContent(result.cleanip);
+      renderCleanIpModalContent(result.cleanip, source);
     }
   } catch (e) {
-    if (summaryEl) summaryEl.textContent = "检测失败";
-    if (termEl) termEl.textContent = "CleanIP 检测失败: " + (e.message || "未知网络错误");
+    if (summaryEl) summaryEl.textContent = source === "intel" ? "三源对比检测失败" : "CleanIP 检测受限 (可点击下方「🔍 切换三源对比报告」)";
+    if (termEl) termEl.textContent = (source === "intel" ? "三源检测失败: " : "CleanIP 检测失败: ") + (e.message || "未知网络错误");
   } finally {
     if (refreshBtn) refreshBtn.disabled = false;
     if (nodeId) {
+      intelTestingIds.delete(nodeId);
       cleanIpTestingIds.delete(nodeId);
       render();
     }
   }
 }
 
-async function openNodeCleanIpModal(nodeId, event) {
+async function openNodeCleanIpModal(nodeId, event, source = "cleanip") {
   if (event) event.stopPropagation();
   const node = nodes.find(n => n && n.id === nodeId);
   if (!node) return;
   const ip = node.ip || node.remote_host || "";
-  currentCleanIpContext = { nodeId, ip, viaProxy: false, useCli: false };
+  currentCleanIpContext = { nodeId, ip, viaProxy: false, useCli: false, source };
+  updateCleanIpModalHeader(source);
   showModal("cleanip_modal", "#btn_refresh_cleanip_modal");
-  if (node.cleanip_report && node.cleanip_score !== undefined && node.cleanip_score !== "") {
-    renderCleanIpModalContent(node);
-    return;
+  if (source === "intel") {
+    if (node.intel_report && node.intel_score !== undefined && node.intel_score !== "") {
+      renderCleanIpModalContent(node, "intel");
+      return;
+    }
+  } else {
+    if (node.cleanip_report && node.cleanip_score !== undefined && node.cleanip_score !== "") {
+      renderCleanIpModalContent(node, "cleanip");
+      return;
+    }
   }
-  await requestCleanIp({ nodeId, ip, force: false, viaProxy: false, useCli: false });
+  await requestCleanIp({ nodeId, ip, force: false, source });
 }
 
-async function checkActiveExitCleanIp(event) {
+async function checkActiveExitCleanIp(event, source = "cleanip") {
   if (event) event.stopPropagation();
   const activeNode = nodes.find(n => n && n.active);
   const nodeId = activeNode ? activeNode.id : "";
   const ip = (activeNode && (activeNode.ip || activeNode.remote_host)) || state.proxy_ip || "";
   showModal("cleanip_modal", "#btn_refresh_cleanip_modal");
-  await requestCleanIp({ nodeId, ip, force: true, viaProxy: true, useCli: true });
+  await requestCleanIp({ nodeId, ip, force: true, source });
 }
 
 async function refreshCurrentCleanIpModal() {
@@ -6187,9 +6308,28 @@ async function refreshCurrentCleanIpModal() {
     nodeId: currentCleanIpContext.nodeId || "",
     ip: currentCleanIpContext.ip || "",
     force: true,
-    viaProxy: Boolean(currentCleanIpContext.viaProxy),
-    useCli: Boolean(currentCleanIpContext.useCli)
+    source: currentCleanIpContext.source || "cleanip"
   });
+}
+
+async function switchCleanIpModalSource() {
+  const nextSource = (currentCleanIpContext.source === "intel") ? "cleanip" : "intel";
+  const nodeId = currentCleanIpContext.nodeId || "";
+  const ip = currentCleanIpContext.ip || "";
+  const node = nodeId ? nodes.find(n => n && n.id === nodeId) : null;
+  currentCleanIpContext.source = nextSource;
+  updateCleanIpModalHeader(nextSource);
+  if (node) {
+    if (nextSource === "intel" && node.intel_report && node.intel_score !== undefined && node.intel_score !== "") {
+      renderCleanIpModalContent(node, "intel");
+      return;
+    }
+    if (nextSource === "cleanip" && node.cleanip_report && node.cleanip_score !== undefined && node.cleanip_score !== "") {
+      renderCleanIpModalContent(node, "cleanip");
+      return;
+    }
+  }
+  await requestCleanIp({ nodeId, ip, force: false, source: nextSource });
 }
 
 function copyCleanIpReport() {
@@ -7546,7 +7686,7 @@ class Handler(BaseHTTPRequestHandler):
                 ip_key = str(n.get("ip") or n.get("remote_host") or "").strip()
                 cached_entry = ip_cache.get(ip_key) if ip_key and isinstance(ip_cache, dict) else None
                 if isinstance(cached_entry, dict):
-                    for ck in vpn_utils.CLEANIP_NODE_FIELDS:
+                    for ck in (*vpn_utils.CLEANIP_NODE_FIELDS, *vpn_utils.INTEL_NODE_FIELDS):
                         if n.get(ck) in (None, "") and cached_entry.get(ck) not in (None, ""):
                             n[ck] = cached_entry[ck]
             connection_state = get_state()
@@ -8168,7 +8308,7 @@ class Handler(BaseHTTPRequestHandler):
                 node_id = str(payload.get("id") or "").strip()
                 target_ip = str(payload.get("ip") or "").strip()
                 force_refresh = bool(payload.get("force"))
-                via_proxy_flag = bool(payload.get("via_proxy"))
+                source = str(payload.get("source") or "cleanip").strip().lower()
 
                 node = None
                 if node_id:
@@ -8178,26 +8318,27 @@ class Handler(BaseHTTPRequestHandler):
                     if node and not target_ip:
                         target_ip = str(node.get("ip") or node.get("remote_host") or "").strip()
 
-                proxy_url = None
-                use_cli = False
-                if via_proxy_flag:
-                    p_host = "127.0.0.1" if LOCAL_PROXY_HOST in ("::", "0.0.0.0", "") else LOCAL_PROXY_HOST
-                    if ":" in p_host and not p_host.startswith("["):
-                        p_host = f"[{p_host}]"
-                    proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
-                    use_cli = bool(payload.get("use_cli", True))
-                    if not target_ip:
-                        st = get_state()
-                        target_ip = str(st.get("proxy_ip") or "").strip()
-                        if target_ip == "-":
-                            target_ip = ""
+                if not target_ip:
+                    st = get_state()
+                    target_ip = str(st.get("proxy_ip") or "").strip()
+                    if target_ip == "-":
+                        target_ip = ""
 
-                result_data = vpn_utils.query_cleanip_for_ip(
-                    target_ip,
-                    force_refresh=force_refresh,
-                    via_proxy=proxy_url,
-                    use_cli_endpoint=use_cli,
-                )
+                # Strictly never route CleanIP or Three-Source queries through the residential VPN tunnel
+                if source == "intel":
+                    result_data = vpn_utils.query_intel_for_ip(
+                        target_ip,
+                        force_refresh=force_refresh,
+                    )
+                    fields_to_save = vpn_utils.INTEL_NODE_FIELDS
+                else:
+                    result_data = vpn_utils.query_cleanip_for_ip(
+                        target_ip,
+                        force_refresh=force_refresh,
+                        via_proxy=None,
+                        use_cli_endpoint=False,
+                    )
+                    fields_to_save = vpn_utils.CLEANIP_NODE_FIELDS
                 resolved_ip = str(result_data.get("ip") or target_ip).strip()
 
                 updated_node = None
@@ -8207,7 +8348,7 @@ class Handler(BaseHTTPRequestHandler):
                     for item in nodes:
                         item_ip = str(item.get("ip") or item.get("remote_host") or "").strip()
                         if (node_id and item.get("id") == node_id) or (resolved_ip and item_ip == resolved_ip):
-                            for ck in vpn_utils.CLEANIP_NODE_FIELDS:
+                            for ck in fields_to_save:
                                 if ck in result_data:
                                     item[ck] = result_data[ck]
                             changed = True
@@ -8225,6 +8366,7 @@ class Handler(BaseHTTPRequestHandler):
                     del updated_node["config_text"]
                 self.send_json({
                     "ok": True,
+                    "source": source,
                     "cleanip": result_data,
                     "node": updated_node,
                 })
@@ -8237,26 +8379,28 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json_body(max_bytes=262144)
                 raw_ids = payload.get("ids") or payload.get("node_ids") or []
                 force_refresh = bool(payload.get("force"))
+                source = str(payload.get("source") or "cleanip").strip().lower()
                 if not isinstance(raw_ids, list):
                     self.send_json({"ok": False, "error": "节点 ID 列表无效"}, HTTPStatus.BAD_REQUEST)
                     return
                 target_ids = [str(x or "").strip() for x in raw_ids if str(x or "").strip()]
                 if not target_ids:
-                    self.send_json({"ok": False, "error": "请先勾选要检测纯净度的节点"}, HTTPStatus.BAD_REQUEST)
+                    self.send_json({"ok": False, "error": "请先勾选要检测的节点"}, HTTPStatus.BAD_REQUEST)
                     return
                 target_ids = list(dict.fromkeys(target_ids))[:50]
 
                 global cleanip_batch_running, cleanip_batch_total, cleanip_batch_completed
                 with lock:
                     if cleanip_batch_running:
-                        self.send_json({"ok": False, "error": "当前已有批量纯净度检测任务正在运行，请稍候"}, HTTPStatus.CONFLICT)
+                        self.send_json({"ok": False, "error": "当前已有批量检测任务正在运行，请稍候"}, HTTPStatus.CONFLICT)
                         return
                     cleanip_batch_running = True
                     cleanip_batch_total = len(target_ids)
                     cleanip_batch_completed = 0
 
-                def run_cleanip_batch(ids_to_check: list[str], force_flag: bool) -> None:
+                def run_cleanip_batch(ids_to_check: list[str], force_flag: bool, src_mode: str) -> None:
                     global cleanip_batch_running, cleanip_batch_total, cleanip_batch_completed
+                    fields_to_save = vpn_utils.INTEL_NODE_FIELDS if src_mode == "intel" else vpn_utils.CLEANIP_NODE_FIELDS
                     try:
                         with lock:
                             nodes_snapshot = read_nodes()
@@ -8269,7 +8413,10 @@ class Handler(BaseHTTPRequestHandler):
                             ip_addr = str(node_item.get("ip") or node_item.get("remote_host") or "").strip()
                             if not ip_addr:
                                 return nid, None
-                            res = vpn_utils.query_cleanip_for_ip(ip_addr, force_refresh=force_flag)
+                            if src_mode == "intel":
+                                res = vpn_utils.query_intel_for_ip(ip_addr, force_refresh=force_flag)
+                            else:
+                                res = vpn_utils.query_cleanip_for_ip(ip_addr, force_refresh=force_flag, via_proxy=None, use_cli_endpoint=False)
                             return nid, res
 
                         max_workers = min(4, max(1, len(ids_to_check)))
@@ -8280,7 +8427,7 @@ class Handler(BaseHTTPRequestHandler):
                                 try:
                                     _, c_res = fut.result()
                                 except Exception as e:
-                                    print(f"[CleanIP Batch] 检测节点 {nid} 失败: {e}", flush=True)
+                                    print(f"[{'Intel' if src_mode == 'intel' else 'CleanIP'} Batch] 检测节点 {nid} 失败: {e}", flush=True)
                                     c_res = None
                                 with lock:
                                     cleanip_batch_completed += 1
@@ -8290,7 +8437,7 @@ class Handler(BaseHTTPRequestHandler):
                                         for item in curr_nodes:
                                             item_ip = str(item.get("ip") or item.get("remote_host") or "").strip()
                                             if item.get("id") == nid or (c_ip and item_ip == c_ip):
-                                                for ck in vpn_utils.CLEANIP_NODE_FIELDS:
+                                                for ck in fields_to_save:
                                                     if ck in c_res:
                                                         item[ck] = c_res[ck]
                                         write_json(NODES_FILE, curr_nodes)
@@ -8301,12 +8448,12 @@ class Handler(BaseHTTPRequestHandler):
                     finally:
                         with lock:
                             cleanip_batch_running = False
-                threading.Thread(target=run_cleanip_batch, args=(target_ids, force_refresh), daemon=True).start()
+                threading.Thread(target=run_cleanip_batch, args=(target_ids, force_refresh, source), daemon=True).start()
                 self.send_json({
                     "ok": True,
                     "started": True,
                     "total": len(target_ids),
-                    "message": f"已在后台启动 {len(target_ids)} 个节点的 CleanIP 纯净度检测",
+                    "message": f"已在后台启动 {len(target_ids)} 个节点的 {'三源情报对比' if source == 'intel' else 'CleanIP 纯净度'}检测",
                 })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)

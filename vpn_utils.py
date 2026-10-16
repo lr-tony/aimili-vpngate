@@ -465,6 +465,23 @@ CLEANIP_NODE_FIELDS = (
     "cleanip_checked_at",
 )
 
+INTEL_NODE_FIELDS = (
+    "intel_score",
+    "intel_grade",
+    "intel_env_score",
+    "intel_env_grade",
+    "intel_is_native",
+    "intel_native_label",
+    "intel_ip_type",
+    "intel_residential_prob",
+    "intel_risk_score",
+    "intel_risk_label",
+    "intel_ai_score",
+    "intel_summary",
+    "intel_report",
+    "intel_checked_at",
+)
+
 def apply_ip_cache_entry(node: dict[str, Any], entry: dict[str, Any]) -> None:
     for key in (
         "owner",
@@ -485,7 +502,7 @@ def apply_ip_cache_entry(node: dict[str, Any], entry: dict[str, Any]) -> None:
             node[key] = entry.get(key, "")
         elif key not in node:
             node[key] = entry.get(key, "")
-    for key in CLEANIP_NODE_FIELDS:
+    for key in (*CLEANIP_NODE_FIELDS, *INTEL_NODE_FIELDS):
         if key in entry and entry.get(key) not in (None, ""):
             node[key] = entry.get(key)
 
@@ -630,7 +647,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         for ip_key, new_entry in new_entries.items():
             prev_entry = cache.get(ip_key)
             if isinstance(prev_entry, dict):
-                for ck in CLEANIP_NODE_FIELDS:
+                for ck in (*CLEANIP_NODE_FIELDS, *INTEL_NODE_FIELDS):
                     if ck in prev_entry and ck not in new_entry:
                         new_entry[ck] = prev_entry[ck]
             cache[ip_key] = new_entry
@@ -892,7 +909,7 @@ def _deref_nuxt_payload(data: list[Any], idx: Any, depth: int = 0) -> Any:
         return {str(k): _deref_nuxt_payload(data, v, depth + 1) for k, v in val.items()}
     return val
 
-def format_cleanip_cli_report(info: dict[str, Any]) -> str:
+def format_cleanip_cli_report(info: dict[str, Any], *, header_title: str = "CleanIP.io", footer_url: str | None = None) -> str:
     ip = str(info.get("ip") or "-")
     rdns = str(info.get("hostname") or "-")
     location = str(info.get("location") or "-")
@@ -918,7 +935,7 @@ def format_cleanip_cli_report(info: dict[str, Any]) -> str:
     risk_line = f"{risk_score}/100 {risk_label}  ← 越低越好" if risk_score >= 0 else risk_label
 
     lines = [
-        "  ██  CleanIP.io",
+        f"  ██  {header_title}",
         "        纯净度检测 · 风险评估 · 原生/住宅识别 · 黑名单监控",
         "        IP Purity & Risk Intelligence",
         "══════════════════════════════════════════════════════════════",
@@ -950,7 +967,7 @@ def format_cleanip_cli_report(info: dict[str, Any]) -> str:
     lines.extend([
         "──────────────────────────────────────────────────────────────",
         "",
-        f"  完整报告 (含黑名单/端口/平台适配): https://cleanip.io/{ip}",
+        f"  {footer_url}" if footer_url else f"  完整报告 (含黑名单/端口/平台适配): https://cleanip.io/{ip}",
     ])
     return "\n".join(lines)
 
@@ -1158,9 +1175,8 @@ def detect_local_vpn_proxy_url() -> tuple[str | None, str | None]:
 
 def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     """
-    Multi-source IP purity & risk intelligence fallback (iplocate.io + ip-api.com + ipapi.is).
-    Used automatically when CleanIP.io rate-limits or blocks the server/tunnel exit IP.
-    Produces the exact same schema and CLI report format as CleanIP.
+    Multi-source IP purity & risk intelligence (iplocate.io + ip-api.com + ipapi.is).
+    Queries public intelligence databases directly from the VPS without touching CleanIP or the residential VPN tunnel.
     """
     iplocate_data: dict[str, Any] = {}
     ipapi_com_data: dict[str, Any] = {}
@@ -1214,7 +1230,7 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
             pass
 
     if not iplocate_data and not ipapi_com_data and not ipapi_is_data:
-        raise ValueError(f"未能从 CleanIP 及备用情报源获取 IP {target_ip} 的纯净度详情")
+        raise ValueError(f"未能从三方情报源 (iplocate.io / ip-api.com / ipapi.is) 获取 IP {target_ip} 的详情")
 
     asn_obj = iplocate_data.get("asn") if isinstance(iplocate_data.get("asn"), dict) else {}
     comp_obj = iplocate_data.get("company") if isinstance(iplocate_data.get("company"), dict) else {}
@@ -1272,7 +1288,6 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
         ip_type_label = "住宅 IP"
         cleanip_ip_type = "Residential ISP"
 
-    # Calculate residential probability & purity score (aligned with CleanIP 0-100 scale)
     if is_hosting:
         res_prob = 5 if not is_native else 12
         base_score = 62 if is_native else 48
@@ -1346,15 +1361,14 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
 
     hostname_str = str(ipapi_com_data.get("reverse") or "-").strip() or "-"
     if score >= 85 and not is_hosting:
-        recommendation = "该 IP 为优质原生/家庭宽带出口，风控极低，非常适合 AI 订阅、流媒体解锁与日常业务。"
+        recommendation = "三源交叉验证：该 IP 为优质原生/家庭宽带出口，无滥用与 Tor 标记，适合 AI 订阅与流媒体。"
     elif score >= 70:
-        recommendation = "该 IP 整体信誉良好，适合大多数常规浏览与业务场景。"
+        recommendation = "三源交叉验证：该 IP 整体信誉良好，适合大多数常规浏览与业务场景。"
     else:
-        recommendation = "该 IP 带有数据中心或共享代理特征，部分严格风控平台可能触发验证。"
+        recommendation = "三源交叉验证：该 IP 带有数据中心或共享代理特征，部分严格风控平台可能触发验证。"
 
     summary_parts = [
-        f"纯净度 {score} ({grade})",
-        f"综合 {env_score} ({env_grade})",
+        f"三源评分 {score} ({grade})",
         native_zh,
         ip_type_label,
         f"住宅率 {res_prob}%",
@@ -1367,7 +1381,7 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
         "hostname": hostname_str,
         "location": location_str,
         "asn_display": asn_display,
-        "cleanip_ip_type": cleanip_ip_type,
+        "cleanip_ip_type": f"{cleanip_ip_type} (ASN:{asn_cc or '-'} / Geo:{geo_cc or '-'})",
         "ip_type_label": ip_type_label,
         "cleanip_native_label": native_zh,
         "cleanip_residential_prob": res_prob,
@@ -1382,10 +1396,28 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
         "checks_summary": checks_summary,
         "recommendation": recommendation,
     }
-    report_text = format_cleanip_cli_report(info_for_report)
+    report_text = format_cleanip_cli_report(
+        info_for_report,
+        header_title="三源风控情报库联合评估 (iplocate.io + ip-api.com + ipapi.is)",
+        footer_url=f"数据源: iplocate.io (Privacy/ASN) · ip-api.com (rDNS/Hosting) · ipapi.is | CleanIP 对比页: https://cleanip.io/{target_ip}",
+    )
     now = time.time()
     return {
         "ip": target_ip,
+        "intel_score": score,
+        "intel_grade": grade,
+        "intel_env_score": env_score,
+        "intel_env_grade": env_grade,
+        "intel_is_native": is_native,
+        "intel_native_label": native_zh,
+        "intel_ip_type": ip_type_label,
+        "intel_residential_prob": res_prob,
+        "intel_risk_score": risk_score,
+        "intel_risk_label": risk_label,
+        "intel_ai_score": ai_score,
+        "intel_summary": summary_str,
+        "intel_report": report_text,
+        "intel_checked_at": now,
         "cleanip_score": score,
         "cleanip_grade": grade,
         "cleanip_env_score": env_score,
@@ -1402,6 +1434,49 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
         "cleanip_url": f"https://cleanip.io/{target_ip}",
         "cleanip_checked_at": now,
     }
+
+def query_intel_for_ip(
+    ip: str,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    target_ip = str(ip or "").strip()
+    if not is_valid_ip_address(target_ip):
+        raise ValueError(f"无效的 IP 地址: {target_ip}")
+
+    now = time.time()
+    if not force_refresh:
+        with ip_cache_lock:
+            cache = load_ip_cache()
+            cached = cache.get(target_ip)
+            if (
+                isinstance(cached, dict)
+                and cached.get("intel_score") not in (None, "")
+                and now - float(cached.get("intel_checked_at", 0) or 0) < IP_CACHE_TTL_SECONDS
+            ):
+                res = {k: cached.get(k) for k in ("ip", *INTEL_NODE_FIELDS) if k in cached}
+                res.update({
+                    "ip": target_ip,
+                    "cached": True,
+                    "cleanip_score": cached.get("intel_score"),
+                    "cleanip_grade": cached.get("intel_grade"),
+                    "cleanip_summary": cached.get("intel_summary"),
+                    "cleanip_report": cached.get("intel_report"),
+                    "cleanip_url": f"https://cleanip.io/{target_ip}",
+                })
+                return res
+
+    result_data = query_multi_source_purity_fallback(target_ip)
+    with ip_cache_lock:
+        cache = load_ip_cache()
+        entry = cache.get(target_ip) if isinstance(cache.get(target_ip), dict) else {}
+        for k in INTEL_NODE_FIELDS:
+            if k in result_data:
+                entry[k] = result_data[k]
+        entry.setdefault("cached_at", now)
+        cache[target_ip] = entry
+        save_ip_cache(cache)
+    return result_data
 
 def solve_cleanip_pow(seed: str, difficulty: int = 4, max_attempts: int = 2_000_000) -> str | None:
     seed_str = str(seed or "").strip()
@@ -1554,13 +1629,13 @@ def query_cleanip_api_v2(
             return build_cleanip_result_from_ip_obj(payload, target_ip)
         if isinstance(payload, dict):
             if payload.get("verify") == "turnstile":
-                last_error = "当前请求出口 IP (如 AWS/机房 IP) 被 CleanIP 要求 Cloudflare Turnstile 真人验证"
+                last_error = "当前 VPS 本机 IP 被 CleanIP 要求 Cloudflare Turnstile 真人验证"
             else:
                 err_msg = str(payload.get("error") or payload.get("message") or "").strip()
                 last_error = f"{err_msg}" + (f" / {tok_err}" if tok_err else "") if err_msg else (tok_err or "API 未返回有效详情")
         else:
             last_error = tok_err or "API 未返回有效详情"
-    raise ValueError(f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情 ({last_error})" if last_error else f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情")
+    raise ValueError(f"CleanIP 官方接口限流/拦截 ({last_error})。已禁用通过家宽隧道请求 CleanIP 以保护您的家宽 IP；请点击旁边的「🔍 三源对比」按钮使用独立情报库检测" if last_error else f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情")
 
 def parse_cleanip_cli_text(raw_text: str, fallback_ip: str = "") -> dict[str, Any]:
     clean_text = strip_ansi(raw_text).strip()
@@ -1622,6 +1697,10 @@ def query_cleanip_for_ip(
     via_proxy: str | None = None,
     use_cli_endpoint: bool = False,
 ) -> dict[str, Any]:
+    """
+    Strictly queries CleanIP.io using the VPS's own direct connection by default.
+    Never automatically routes through the residential VPN tunnel so the user's residential IP is never rate-limited/blocked by CleanIP.
+    """
     target_ip = str(ip or "").strip()
     if not use_cli_endpoint and not is_valid_ip_address(target_ip):
         raise ValueError(f"无效的 IP 地址: {target_ip}")
@@ -1640,89 +1719,43 @@ def query_cleanip_for_ip(
 
     curl_bin = "curl.exe" if os.name == "nt" else "curl"
     result_data: dict[str, Any] | None = None
-    auto_proxy_url, auto_proxy_auth = detect_local_vpn_proxy_url()
 
-    if use_cli_endpoint:
-        eff_proxy = via_proxy or auto_proxy_url
-        cmd = [curl_bin, "-sS", "-L", "--max-time", "14"]
-        if eff_proxy:
-            cmd.extend(["-x", eff_proxy])
-            if auto_proxy_auth and eff_proxy == auto_proxy_url:
-                cmd.extend(["--proxy-user", auto_proxy_auth])
-        cmd.append("https://cleanip.io/cli")
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=16)
-        if res.returncode == 0 and res.stdout.strip():
-            try:
-                result_data = parse_cleanip_cli_text(res.stdout, fallback_ip=target_ip)
-                if not target_ip:
-                    target_ip = str(result_data.get("ip") or "").strip()
-            except Exception:
-                result_data = None
+    # Notice: even if use_cli_endpoint or via_proxy was requested by legacy callers,
+    # we do NOT use the residential VPN tunnel unless explicitly forced, and we prefer direct IP lookup.
+    if not is_valid_ip_address(target_ip):
+        raise RuntimeError("未能获取到有效的出口 IP 地址进行 CleanIP 查询")
+
+    api_error = ""
+    try:
+        result_data = query_cleanip_api_v2(target_ip, via_proxy=None)
+    except Exception as api_exc:
+        api_error = str(api_exc)
+        result_data = None
 
     if result_data is None:
-        if not is_valid_ip_address(target_ip):
-            raise RuntimeError("未能获取到有效的出口 IP 地址进行 CleanIP 查询")
+        try:
+            url = f"https://cleanip.io/{urllib.parse.quote(target_ip)}"
+            cmd = [
+                curl_bin,
+                "-sS",
+                "-L",
+                "--max-time",
+                "15",
+                "-A",
+                CLEANIP_BROWSER_UA,
+                "-H",
+                "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
+                url,
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
+            if res.returncode == 0 and res.stdout.strip():
+                result_data = parse_cleanip_html_payload(res.stdout, target_ip)
+        except Exception as html_exc:
+            if not api_error:
+                api_error = str(html_exc)
 
-        # Build candidate route list: if active VPN tunnel proxy is available, try it first (avoids VPS datacenter IP Turnstile block)
-        route_candidates: list[tuple[str | None, str | None]] = []
-        if via_proxy:
-            route_candidates.append((via_proxy, auto_proxy_auth if via_proxy == auto_proxy_url else None))
-            route_candidates.append((None, None))
-        else:
-            if auto_proxy_url:
-                route_candidates.append((auto_proxy_url, auto_proxy_auth))
-            route_candidates.append((None, None))
-
-        api_errors: list[str] = []
-        for route_proxy, route_auth in route_candidates:
-            try:
-                result_data = query_cleanip_api_v2(
-                    target_ip,
-                    via_proxy=route_proxy,
-                    proxy_auth=route_auth,
-                )
-                if result_data is not None:
-                    break
-            except Exception as api_exc:
-                api_errors.append(str(api_exc))
-                result_data = None
-
-        # Fallback to SSR HTML payload parsing across the same routes
-        if result_data is None:
-            for route_proxy, route_auth in route_candidates:
-                try:
-                    url = f"https://cleanip.io/{urllib.parse.quote(target_ip)}"
-                    cmd = [
-                        curl_bin,
-                        "-sS",
-                        "-L",
-                        "--max-time",
-                        "15",
-                        "-A",
-                        CLEANIP_BROWSER_UA,
-                        "-H",
-                        "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
-                        url,
-                    ]
-                    if route_proxy:
-                        cmd.extend(["-x", route_proxy])
-                        if route_auth:
-                            cmd.extend(["--proxy-user", route_auth])
-                    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
-                    if res.returncode == 0 and res.stdout.strip():
-                        result_data = parse_cleanip_html_payload(res.stdout, target_ip)
-                        if result_data is not None:
-                            break
-                except Exception as html_exc:
-                    if not api_errors:
-                        api_errors.append(str(html_exc))
-
-        if result_data is None:
-            try:
-                result_data = query_multi_source_purity_fallback(target_ip)
-            except Exception:
-                detail = api_errors[0] if api_errors else f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情"
-                raise ValueError(detail)
+    if result_data is None:
+        raise ValueError(api_error or f"未能从 CleanIP 响应中提取 IP {target_ip} 的纯净度详情")
 
     if target_ip and is_valid_ip_address(target_ip):
         with ip_cache_lock:
