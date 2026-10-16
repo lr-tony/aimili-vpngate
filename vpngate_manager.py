@@ -4925,7 +4925,7 @@ INDEX_HTML = r"""<!doctype html>
             </th>
             <th style="width: 90px;">状态</th>
             <th style="width: 210px;">IP 地址 : 端口</th>
-            <th style="width: 125px; cursor: pointer; user-select: none;" onclick="toggleSortColumn('latency')" title="点击切换延迟从低到高 / 从高到低排序">延迟 <span id="sort_icon_latency" style="font-size:11px; opacity:0.65;">↕</span></th>
+            <th style="width: 125px;"><span style="cursor: pointer; user-select: none;" onclick="toggleSortColumn('latency')" title="点击切换延迟从低到高 / 从高到低排序">延迟 <span id="sort_icon_latency" style="font-size:11px; opacity:0.65;">↕</span></span></th><!-- <th style="width: 125px;">延迟</th> -->
             <th>物理位置 (都道府县)</th>
             <th>运营主体 / ISP</th>
             <th style="width: 165px; cursor: pointer; user-select: none;" onclick="toggleSortColumn('purity')" title="点击切换纯净度从高到低 / 从低到高排序">IP 类型 / 纯净度 <span id="sort_icon_purity" style="font-size:11px; opacity:0.65;">↕</span></th>
