@@ -338,6 +338,7 @@ def load_ui_config() -> dict[str, Any]:
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
+            "fav_region": "",
             "fav_fail_fallback": False,
             "discovery_countries": [],
         }
@@ -792,6 +793,7 @@ def get_state() -> dict[str, Any]:
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
+    state["fav_region"] = str(ui_cfg.get("fav_region") or "").strip()
     state["discovery_countries"] = normalize_discovery_countries(ui_cfg.get("discovery_countries"))
     state["fav_fail_fallback"] = False
     state["batch_test_running"] = batch_test_running
@@ -1950,6 +1952,98 @@ def ip_enrichment_loop() -> None:
         ip_enrichment_wakeup.wait(300 if nodes_exist else 5)
         ip_enrichment_wakeup.clear()
 
+JP_PREFECTURE_ALIASES: dict[str, str] = {
+    "tokyo": "东京都", "东京": "东京都", "东京都": "东京都", "東京都": "东京都",
+    "osaka": "大阪府", "大阪": "大阪府", "大阪府": "大阪府",
+    "hokkaido": "北海道", "北海道": "北海道",
+    "kyoto": "京都府", "京都": "京都府", "京都府": "京都府",
+    "kanagawa": "神奈川县", "神奈川": "神奈川县", "神奈川县": "神奈川县", "神奈川県": "神奈川县",
+    "saitama": "埼玉县", "埼玉": "埼玉县", "埼玉县": "埼玉县", "埼玉県": "埼玉县",
+    "chiba": "千叶县", "千叶": "千叶县", "千叶县": "千叶县", "千葉県": "千叶县",
+    "aichi": "爱知县", "爱知": "爱知县", "爱知县": "爱知县", "愛知県": "爱知县",
+    "fukuoka": "福冈县", "福冈": "福冈县", "福冈县": "福冈县", "福岡県": "福冈县",
+    "hyogo": "兵库县", "兵库": "兵库县", "兵库县": "兵库县", "兵庫県": "兵库县",
+    "ibaraki": "茨城县", "茨城": "茨城县", "茨城县": "茨城县", "茨城県": "茨城县",
+    "hiroshima": "广岛县", "广岛": "广岛县", "广岛县": "广岛县", "広島県": "广岛县",
+    "miyagi": "宫城县", "宫城": "宫城县", "宫城县": "宫城县", "宮城県": "宫城县",
+    "shizuoka": "静冈县", "静冈": "静冈县", "静冈县": "静冈县", "静岡県": "静冈县",
+    "niigata": "新潟县", "新潟": "新潟县", "新潟县": "新潟县", "新潟県": "新潟县",
+    "nagano": "长野县", "长野": "长野县", "长野县": "长野县", "長野県": "长野县",
+    "gifu": "岐阜县", "岐阜": "岐阜县", "岐阜县": "岐阜县", "岐阜県": "岐阜县",
+    "gunma": "群马县", "群马": "群马县", "群马县": "群马县", "群馬県": "群马县",
+    "tochigi": "栃木县", "栃木": "栃木县", "栃木县": "栃木县", "栃木県": "栃木县",
+    "okayama": "冈山县", "冈山": "冈山县", "冈山县": "冈山县", "岡山県": "冈山县",
+    "mie": "三重县", "三重": "三重县", "三重县": "三重县", "三重県": "三重县",
+    "kumamoto": "熊本县", "熊本": "熊本县", "熊本县": "熊本县", "熊本県": "熊本县",
+    "kagoshima": "鹿儿岛县", "鹿儿岛": "鹿儿岛县", "鹿儿岛县": "鹿儿岛县", "鹿児島県": "鹿儿岛县",
+    "okinawa": "冲绳县", "冲绳": "冲绳县", "冲绳县": "冲绳县", "沖縄県": "冲绳县",
+    "shiga": "滋贺县", "滋贺": "滋贺县", "滋贺县": "滋贺县", "滋賀県": "滋贺县",
+    "yamaguchi": "山口县", "山口": "山口县", "山口县": "山口县", "山口県": "山口县",
+    "ehime": "爱媛县", "爱媛": "爱媛县", "爱媛县": "爱媛县", "愛媛県": "爱媛县",
+    "nagasaki": "长崎县", "长崎": "长崎县", "长崎县": "长崎县", "長崎県": "长崎县",
+    "nara": "奈良县", "奈良": "奈良县", "奈良县": "奈良县", "奈良県": "奈良县",
+    "aomori": "青森县", "青森": "青森县", "青森县": "青森县", "青森県": "青森县",
+    "iwate": "岩手县", "岩手": "岩手县", "岩手县": "岩手县", "岩手県": "岩手县",
+    "oita": "大分县", "大分": "大分县", "大分县": "大分县", "大分県": "大分县",
+    "ishikawa": "石川县", "石川": "石川县", "石川县": "石川县", "石川県": "石川县",
+    "yamagata": "山形县", "山形": "山形县", "山形县": "山形县", "山形県": "山形县",
+    "miyazaki": "宫崎县", "宫崎": "宫崎县", "宫崎县": "宫崎县", "宮崎県": "宫崎县",
+    "fukushima": "福岛县", "福岛": "福岛县", "福岛县": "福岛县", "福島県": "福岛县",
+    "toyama": "富山县", "富山": "富山县", "富山县": "富山县", "富山県": "富山县",
+    "kagawa": "香川县", "香川": "香川县", "香川县": "香川县", "香川県": "香川县",
+    "wakayama": "和歌山县", "和歌山": "和歌山县", "和歌山县": "和歌山县", "和歌山県": "和歌山县",
+    "akita": "秋田县", "秋田": "秋田县", "秋田县": "秋田县", "秋田県": "秋田县",
+    "saga": "佐贺县", "佐贺": "佐贺县", "佐贺县": "佐贺县", "佐賀県": "佐贺县",
+    "yamanashi": "山梨县", "山梨": "山梨县", "山梨县": "山梨县", "山梨県": "山梨县",
+    "fukui": "福井县", "福井": "福井县", "福井县": "福井县", "福井県": "福井县",
+    "tokushima": "德岛县", "德岛": "德岛县", "德岛县": "德岛县", "徳島県": "德岛县",
+    "kochi": "高知县", "高知": "高知县", "高知县": "高知县", "高知県": "高知县",
+    "shimane": "岛根县", "岛根": "岛根县", "岛根县": "岛根县", "島根県": "岛根县",
+    "tottori": "鸟取县", "鸟取": "鸟取县", "鸟取县": "鸟取县", "鳥取県": "鸟取县",
+}
+
+def normalize_region_token(token: str) -> str:
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"\s+(?:prefecture|province|state|metropolis|city)$", "", raw, flags=re.I).strip()
+    lower = cleaned.lower()
+    if lower in JP_PREFECTURE_ALIASES:
+        return JP_PREFECTURE_ALIASES[lower]
+    if cleaned in JP_PREFECTURE_ALIASES:
+        return JP_PREFECTURE_ALIASES[cleaned]
+    return cleaned
+
+def extract_node_region(node: dict[str, Any]) -> str:
+    loc = str(node.get("location") or "").strip()
+    if loc:
+        parts = [p.strip() for p in re.split(r"[\s·,/|]+", loc) if p.strip()]
+        if len(parts) >= 2:
+            return normalize_region_token(parts[1])
+        if len(parts) == 1:
+            country_zh = normalized_country_name(node.get("country"))
+            if parts[0] != country_zh:
+                return normalize_region_token(parts[0])
+    for rep_key in ("cleanip_report", "intel_report"):
+        rep = str(node.get(rep_key) or "")
+        if rep:
+            m = re.search(r"归属地\s+([^\n]+)", rep)
+            if m:
+                rparts = [p.strip() for p in re.split(r"[\s·,/|]+", m.group(1)) if p.strip()]
+                if len(rparts) >= 2:
+                    return normalize_region_token(rparts[1])
+    return ""
+
+def node_matches_region(node: dict[str, Any], target_region: Any) -> bool:
+    target = normalize_region_token(str(target_region or ""))
+    if not target:
+        return True
+    node_reg = extract_node_region(node)
+    if node_reg and (node_reg == target or target in node_reg or node_reg in target):
+        return True
+    loc = str(node.get("location") or "")
+    return target in loc
+
 def apply_routing_filters(
     nodes: list[dict[str, Any]],
     ui_cfg: dict[str, Any],
@@ -1967,6 +2061,9 @@ def apply_routing_filters(
     elif routing_mode == "favorites":
         fav_ids = set(ui_cfg.get("favorite_node_ids", []))
         candidates = [n for n in candidates if n.get("id") in fav_ids]
+        fav_region = str(ui_cfg.get("fav_region") or "").strip()
+        if fav_region:
+            candidates = [n for n in candidates if node_matches_region(n, fav_region)]
 
     routing_ip_type = ui_cfg.get("routing_ip_type", "all")
     if routing_ip_type == "residential":
@@ -2050,6 +2147,9 @@ def validate_node_allowed_by_routing(node: dict[str, Any], ui_cfg: dict[str, Any
         fav_ids = set(ui_cfg.get("favorite_node_ids", []))
         if node_id not in fav_ids:
             raise RuntimeError("当前处于仅用收藏模式，不能连接未收藏节点")
+        fav_region = str(ui_cfg.get("fav_region") or "").strip()
+        if fav_region and not node_matches_region(node, fav_region):
+            raise RuntimeError(f"当前仅用收藏已限定【{fav_region}】地区轮换，不能连接其他地区的收藏节点")
 
     routing_ip_type = ui_cfg.get("routing_ip_type", "all")
     node_ip_type = node.get("ip_type")
@@ -4726,10 +4826,20 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
     </div>
+    <select id="region_filter" title="按都道府县/州省地区筛选节点">
+      <option value="">所有地区 (都道府县)</option>
+    </select>
     <select id="ip_type_filter">
       <option value="">所有IP类型</option>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
+    </select>
+    <select id="sort_filter" title="按纯净度评分或延迟高低排序">
+      <option value="default">排序：默认综合评分</option>
+      <option value="purity_desc">纯净度：从高到低 ↓</option>
+      <option value="purity_asc">纯净度：从低到高 ↑</option>
+      <option value="latency_asc">延迟：从低到高 (最快) ↑</option>
+      <option value="latency_desc">延迟：从高到低 ↓</option>
     </select>
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -4749,7 +4859,13 @@ INDEX_HTML = r"""<!doctype html>
             在这里管理您的收藏节点过滤，以及设置出站连接漂移策略。
           </span>
         </div>
-        <div style="display: flex; gap: 12px; align-items: center;">
+        <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 12px; color: var(--text-secondary); white-space: nowrap;">轮换地区限定:</span>
+            <select id="fav_region_select" onchange="changeFavRegion(this.value)" style="height: 36px; padding: 0 12px; font-size: 13px; border-radius: 6px; background: rgba(255,255,255,0.04); border: 1px solid var(--border-color); color: var(--text-primary); cursor: pointer;">
+              <option value="">全部收藏地区 (不限都道府县)</option>
+            </select>
+          </div>
           <button id="btn_toggle_fav_routing" type="button" class="toolbar-btn" style="height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;" onclick="toggleFavRouting()">
             启用仅用收藏出站
           </button>
@@ -4809,10 +4925,10 @@ INDEX_HTML = r"""<!doctype html>
             </th>
             <th style="width: 90px;">状态</th>
             <th style="width: 210px;">IP 地址 : 端口</th>
-            <th style="width: 125px;">延迟</th>
-            <th>物理位置</th>
+            <th style="width: 125px; cursor: pointer; user-select: none;" onclick="toggleSortColumn('latency')" title="点击切换延迟从低到高 / 从高到低排序">延迟 <span id="sort_icon_latency" style="font-size:11px; opacity:0.65;">↕</span></th>
+            <th>物理位置 (都道府县)</th>
             <th>运营主体 / ISP</th>
-            <th style="width: 165px;">IP 类型 / 纯净度</th>
+            <th style="width: 165px; cursor: pointer; user-select: none;" onclick="toggleSortColumn('purity')" title="点击切换纯净度从高到低 / 从低到高排序">IP 类型 / 纯净度 <span id="sort_icon_purity" style="font-size:11px; opacity:0.65;">↕</span></th>
             <th style="width: 265px;">操作</th>
           </tr>
         </thead>
@@ -5537,11 +5653,198 @@ function clearDiscoveryCountries(event) {
   render();
 }
 
-function getFilteredNodes() {
-  const selectedIpType = $("ip_type_filter").value;
-  const selectedStatus = $("status_filter").value;
+const JP_PREFECTURE_MAP = {
+  "tokyo": "东京都", "东京": "东京都", "东京都": "东京都", "東京都": "东京都",
+  "osaka": "大阪府", "大阪": "大阪府", "大阪府": "大阪府",
+  "hokkaido": "北海道", "北海道": "北海道",
+  "kyoto": "京都府", "京都": "京都府", "京都府": "京都府",
+  "kanagawa": "神奈川县", "神奈川": "神奈川县", "神奈川县": "神奈川县", "神奈川県": "神奈川县",
+  "saitama": "埼玉县", "埼玉": "埼玉县", "埼玉县": "埼玉县", "埼玉県": "埼玉县",
+  "chiba": "千叶县", "千叶": "千叶县", "千叶县": "千叶县", "千葉県": "千叶县",
+  "aichi": "爱知县", "爱知": "爱知县", "爱知县": "爱知县", "愛知県": "爱知县",
+  "fukuoka": "福冈县", "福冈": "福冈县", "福冈县": "福冈县", "福岡県": "福冈县",
+  "hyogo": "兵库县", "兵库": "兵库县", "兵库县": "兵库县", "兵庫県": "兵库县",
+  "ibaraki": "茨城县", "茨城": "茨城县", "茨城县": "茨城县", "茨城県": "茨城县",
+  "hiroshima": "广岛县", "广岛": "广岛县", "广岛县": "广岛县", "広島県": "广岛县",
+  "miyagi": "宫城县", "宫城": "宫城县", "宫城县": "宫城县", "宮城県": "宫城县",
+  "shizuoka": "静冈县", "静冈": "静冈县", "静冈县": "静冈县", "静岡県": "静冈县",
+  "niigata": "新潟县", "新潟": "新潟县", "新潟县": "新潟县", "新潟県": "新潟县",
+  "nagano": "长野县", "长野": "长野县", "长野县": "长野县", "長野県": "长野县",
+  "gifu": "岐阜县", "岐阜": "岐阜县", "岐阜县": "岐阜县", "岐阜県": "岐阜县",
+  "gunma": "群马县", "群马": "群马县", "群马县": "群马县", "群馬県": "群马县",
+  "tochigi": "栃木县", "栃木": "栃木县", "栃木县": "栃木县", "栃木県": "栃木县",
+  "okayama": "冈山县", "冈山": "冈山县", "冈山县": "冈山县", "岡山県": "冈山县",
+  "mie": "三重县", "三重": "三重县", "三重县": "三重县", "三重県": "三重县",
+  "kumamoto": "熊本县", "熊本": "熊本县", "熊本县": "熊本县", "熊本県": "熊本县",
+  "kagoshima": "鹿儿岛县", "鹿儿岛": "鹿儿岛县", "鹿儿岛县": "鹿儿岛县", "鹿児島県": "鹿儿岛县",
+  "okinawa": "冲绳县", "冲绳": "冲绳县", "冲绳县": "冲绳县", "沖縄県": "冲绳县",
+  "shiga": "滋贺县", "滋贺": "滋贺县", "滋贺县": "滋贺县", "滋賀県": "滋贺县",
+  "yamaguchi": "山口县", "山口": "山口县", "山口县": "山口县", "山口県": "山口县",
+  "ehime": "爱媛县", "爱媛": "爱媛县", "爱媛县": "爱媛县", "愛媛県": "爱媛县",
+  "nagasaki": "长崎县", "长崎": "长崎县", "长崎县": "长崎县", "長崎県": "长崎县",
+  "nara": "奈良县", "奈良": "奈良县", "奈良县": "奈良县", "奈良県": "奈良县",
+  "aomori": "青森县", "青森": "青森县", "青森县": "青森县", "青森県": "青森县",
+  "iwate": "岩手县", "岩手": "岩手县", "岩手县": "岩手县", "岩手県": "岩手县",
+  "oita": "大分县", "大分": "大分县", "大分县": "大分县", "大分県": "大分县",
+  "ishikawa": "石川县", "石川": "石川县", "石川县": "石川县", "石川県": "石川县",
+  "yamagata": "山形县", "山形": "山形县", "山形县": "山形县", "山形県": "山形县",
+  "miyazaki": "宫崎县", "宫崎": "宫崎县", "宫崎县": "宫崎县", "宮崎県": "宫崎县",
+  "fukushima": "福岛县", "福岛": "福岛县", "福岛县": "福岛县", "福島県": "福岛县",
+  "toyama": "富山县", "富山": "富山县", "富山县": "富山县", "富山県": "富山县",
+  "kagawa": "香川县", "香川": "香川县", "香川县": "香川县", "香川県": "香川县",
+  "wakayama": "和歌山县", "和歌山": "和歌山县", "和歌山县": "和歌山县", "和歌山県": "和歌山县",
+  "akita": "秋田县", "秋田": "秋田县", "秋田县": "秋田县", "秋田県": "秋田县",
+  "saga": "佐贺县", "佐贺": "佐贺县", "佐贺县": "佐贺县", "佐賀県": "佐贺县",
+  "yamanashi": "山梨县", "山梨": "山梨县", "山梨县": "山梨县", "山梨県": "山梨县",
+  "fukui": "福井县", "福井": "福井县", "福井县": "福井县", "福井県": "福井县",
+  "tokushima": "德岛县", "德岛": "德岛县", "德岛县": "德岛县", "徳島県": "德岛县",
+  "kochi": "高知县", "高知": "高知县", "高知县": "高知县", "高知県": "高知县",
+  "shimane": "岛根县", "岛根": "岛根县", "岛根县": "岛根县", "島根県": "岛根县",
+  "tottori": "鸟取县", "鸟取": "鸟取县", "鸟取县": "鸟取县", "鳥取県": "鸟取县"
+};
+
+function normalizeRegionToken(token) {
+  const raw = String(token || "").trim();
+  if (!raw) return "";
+  const cleaned = raw.replace(/\s+(?:prefecture|province|state|metropolis|city)$/i, "").trim();
+  const lower = cleaned.toLowerCase();
+  if (JP_PREFECTURE_MAP[lower]) return JP_PREFECTURE_MAP[lower];
+  if (JP_PREFECTURE_MAP[cleaned]) return JP_PREFECTURE_MAP[cleaned];
+  return cleaned;
+}
+
+function getNodeRegion(node) {
+  if (!node) return "";
+  const loc = String(node.location || "").trim();
+  if (loc) {
+    const parts = loc.split(/[\s·,/|]+/).map(s => s.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      return normalizeRegionToken(parts[1]);
+    }
+    if (parts.length === 1) {
+      const countryZh = translateCountry(node.country);
+      if (parts[0] !== countryZh) return normalizeRegionToken(parts[0]);
+    }
+  }
+  const rep = String(node.cleanip_report || node.intel_report || "");
+  if (rep) {
+    const m = rep.match(/归属地\s+([^\n]+)/);
+    if (m) {
+      const rparts = m[1].split(/[\s·,/|]+/).map(s => s.trim()).filter(Boolean);
+      if (rparts.length >= 2) return normalizeRegionToken(rparts[1]);
+    }
+  }
+  return "";
+}
+
+function getNodeEffectivePurity(node) {
+  if (!node) return null;
+  const c = node.cleanip_score;
+  if (c !== undefined && c !== null && c !== "" && Number.isFinite(Number(c))) {
+    return Number(c);
+  }
+  const i = node.intel_score;
+  if (i !== undefined && i !== null && i !== "" && Number.isFinite(Number(i))) {
+    return Number(i);
+  }
+  return null;
+}
+
+function getNodeEffectiveLatency(node) {
+  if (!node) return null;
+  const measured = Number(node.latency_ms) || 0;
+  if (measured > 0) return measured;
+  const estimated = Number(node.ping) || 0;
+  if (estimated > 0) return estimated;
+  return null;
+}
+
+function updateRegionFilterOptions() {
+  const regSelect = $("region_filter");
+  const favRegSelect = $("fav_region_select");
   const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
-  return nodes.filter(n => {
+  const allRegionCounts = new Map();
+  const favRegionCounts = new Map();
+
+  nodes.forEach(n => {
+    if (!n) return;
+    const countryCode = String(n.country_short || "").trim().toUpperCase();
+    const isFav = favoriteIds.includes(n.id);
+    const reg = getNodeRegion(n);
+    if (!reg) return;
+    if (isFav) {
+      favRegionCounts.set(reg, (favRegionCounts.get(reg) || 0) + 1);
+    }
+    if (showFavoritesOnly && !isFav) return;
+    if (!showFavoritesOnly && selectedDiscoveryCountries.size && !selectedDiscoveryCountries.has(countryCode)) return;
+    allRegionCounts.set(reg, (allRegionCounts.get(reg) || 0) + 1);
+  });
+
+  if (regSelect) {
+    const prevVal = regSelect.value || "";
+    const sortedRegions = Array.from(allRegionCounts.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
+    let html = '<option value="">所有地区 (都道府县)</option>';
+    sortedRegions.forEach(([reg, cnt]) => {
+      html += `<option value="${esc(reg)}" ${reg === prevVal ? "selected" : ""}>${esc(reg)} (${cnt})</option>`;
+    });
+    if (prevVal && !allRegionCounts.has(prevVal)) {
+      html += `<option value="${esc(prevVal)}" selected>${esc(prevVal)} (0)</option>`;
+    }
+    setHtmlIfChanged(regSelect, html);
+    regSelect.value = prevVal;
+  }
+
+  if (favRegSelect) {
+    const savedFavReg = String(state.fav_region || "").trim();
+    const sortedFavRegions = Array.from(favRegionCounts.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
+    let fhtml = '<option value="">全部收藏地区 (不限都道府县)</option>';
+    sortedFavRegions.forEach(([reg, cnt]) => {
+      fhtml += `<option value="${esc(reg)}" ${reg === savedFavReg ? "selected" : ""}>仅轮换：${esc(reg)} (${cnt}个收藏)</option>`;
+    });
+    if (savedFavReg && !favRegionCounts.has(savedFavReg)) {
+      fhtml += `<option value="${esc(savedFavReg)}" selected>仅轮换：${esc(savedFavReg)} (0个收藏)</option>`;
+    }
+    setHtmlIfChanged(favRegSelect, fhtml);
+    favRegSelect.value = savedFavReg;
+  }
+}
+
+function toggleSortColumn(col) {
+  const sortSelect = $("sort_filter");
+  if (!sortSelect) return;
+  const cur = sortSelect.value || "default";
+  if (col === "purity") {
+    sortSelect.value = (cur === "purity_desc") ? "purity_asc" : "purity_desc";
+  } else if (col === "latency") {
+    sortSelect.value = (cur === "latency_asc") ? "latency_desc" : "latency_asc";
+  }
+  currentPage = 1;
+  render();
+}
+
+function updateSortHeaderIcons() {
+  const sortMode = $("sort_filter") ? $("sort_filter").value : "default";
+  const latIcon = $("sort_icon_latency");
+  const purIcon = $("sort_icon_purity");
+  if (latIcon) {
+    latIcon.textContent = sortMode === "latency_asc" ? "↑" : (sortMode === "latency_desc" ? "↓" : "↕");
+    latIcon.style.opacity = sortMode.startsWith("latency_") ? "1" : "0.55";
+    latIcon.style.color = sortMode.startsWith("latency_") ? "var(--primary)" : "";
+  }
+  if (purIcon) {
+    purIcon.textContent = sortMode === "purity_desc" ? "↓" : (sortMode === "purity_asc" ? "↑" : "↕");
+    purIcon.style.opacity = sortMode.startsWith("purity_") ? "1" : "0.55";
+    purIcon.style.color = sortMode.startsWith("purity_") ? "var(--primary)" : "";
+  }
+}
+
+function getFilteredNodes() {
+  const selectedIpType = $("ip_type_filter") ? $("ip_type_filter").value : "";
+  const selectedStatus = $("status_filter") ? $("status_filter").value : "all";
+  const selectedRegion = $("region_filter") ? $("region_filter").value : "";
+  const sortMode = $("sort_filter") ? $("sort_filter").value : "default";
+  const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
+  const filtered = nodes.filter(n => {
     if (!n) return false;
     const isFavNode = favoriteIds.includes(n.id);
     if (showFavoritesOnly && !isFavNode) {
@@ -5550,6 +5853,12 @@ function getFilteredNodes() {
     const countryCode = String(n.country_short || "").trim().toUpperCase();
     if (!showFavoritesOnly && selectedDiscoveryCountries.size && !selectedDiscoveryCountries.has(countryCode)) {
       return false;
+    }
+    if (selectedRegion) {
+      const nReg = getNodeRegion(n);
+      if (nReg !== selectedRegion && !String(n.location || "").includes(selectedRegion)) {
+        return false;
+      }
     }
     if (selectedIpType) {
       if (selectedIpType === "residential" && !["residential", "mobile"].includes(n.ip_type)) {
@@ -5570,6 +5879,35 @@ function getFilteredNodes() {
     }
     return true;
   });
+
+  if (sortMode && sortMode !== "default") {
+    filtered.sort((a, b) => {
+      if (sortMode === "purity_desc" || sortMode === "purity_asc") {
+        const pa = getNodeEffectivePurity(a);
+        const pb = getNodeEffectivePurity(b);
+        if (pa === null && pb === null) return (b.score || 0) - (a.score || 0);
+        if (pa === null) return 1;
+        if (pb === null) return -1;
+        if (pa !== pb) return sortMode === "purity_desc" ? (pb - pa) : (pa - pb);
+        const la = getNodeEffectiveLatency(a) ?? 999999;
+        const lb = getNodeEffectiveLatency(b) ?? 999999;
+        return la - lb;
+      }
+      if (sortMode === "latency_asc" || sortMode === "latency_desc") {
+        const la = getNodeEffectiveLatency(a);
+        const lb = getNodeEffectiveLatency(b);
+        if (la === null && lb === null) return (b.score || 0) - (a.score || 0);
+        if (la === null) return 1;
+        if (lb === null) return -1;
+        if (la !== lb) return sortMode === "latency_asc" ? (la - lb) : (lb - la);
+        const pa = getNodeEffectivePurity(a) ?? -1;
+        const pb = getNodeEffectivePurity(b) ?? -1;
+        return pb - pa;
+      }
+      return 0;
+    });
+  }
+  return filtered;
 }
 
 function stableSortNodes() {
@@ -5686,6 +6024,8 @@ function render(){
   }
   setHtmlIfChanged(activeCardContainer, activeCardHtml);
 
+  updateRegionFilterOptions();
+  updateSortHeaderIcons();
   const shown = getFilteredNodes();
   
   if ($("total")) $("total").textContent = nodes.length; 
@@ -6554,6 +6894,8 @@ document.addEventListener("keydown", event => {
 });
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
+if ($("region_filter")) $("region_filter").onchange=()=>{ currentPage = 1; render(); };
+if ($("sort_filter")) $("sort_filter").onchange=()=>{ currentPage = 1; render(); };
 
 $("refresh").onclick=async()=>{
   refreshButtonBusy("正在启动更新...");
@@ -6754,8 +7096,11 @@ function updateFavPanelUI() {
 async function toggleFavRouting() {
   if (!state) return;
   const newMode = state.routing_mode === "favorites" ? "auto" : "favorites";
+  const favRegSelect = $("fav_region_select");
+  const selectedFavReg = favRegSelect ? favRegSelect.value : (state.fav_region || "");
   
   state.routing_mode = newMode;
+  state.fav_region = selectedFavReg;
   updateFavPanelUI();
   
   try {
@@ -6765,7 +7110,8 @@ async function toggleFavRouting() {
       body: JSON.stringify({
         routing_mode: newMode,
         force_country: state.force_country || "",
-        routing_ip_type: state.routing_ip_type || "all"
+        routing_ip_type: state.routing_ip_type || "all",
+        fav_region: selectedFavReg
       })
     }, 25000);
     const data = await readJsonResponse(res, "更新出站路由设置失败");
@@ -6773,6 +7119,39 @@ async function toggleFavRouting() {
       load();
     } else {
       alert("更新出站路由设置失败: " + (data.error || "未知错误"));
+      load();
+    }
+  } catch (err) {
+    alert("连接服务器失败，请稍后重试");
+    load();
+  }
+}
+
+async function changeFavRegion(newRegion) {
+  if (!state) return;
+  const normalizedReg = String(newRegion || "").trim();
+  state.fav_region = normalizedReg;
+  if ($("region_filter") && showFavoritesOnly) {
+    $("region_filter").value = normalizedReg;
+    currentPage = 1;
+    render();
+  }
+  try {
+    const res = await fetchWithTimeout("./api/update_routing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        routing_mode: state.routing_mode || "auto",
+        force_country: state.force_country || "",
+        routing_ip_type: state.routing_ip_type || "all",
+        fav_region: normalizedReg
+      })
+    }, 25000);
+    const data = await readJsonResponse(res, "更新收藏地区轮换设置失败");
+    if (res.ok && data.ok) {
+      load();
+    } else {
+      alert("更新收藏地区轮换设置失败: " + (data.error || "未知错误"));
       load();
     }
   } catch (err) {
@@ -8062,6 +8441,8 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = normalize_routing_country(payload.get("force_country"), read_nodes())
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
+                fav_region_specified = "fav_region" in payload
+                fav_region_val = normalize_region_token(str(payload.get("fav_region") or ""))
                 fav_fail_fallback = False
                 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
@@ -8083,6 +8464,8 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
+                if fav_region_specified:
+                    ui_cfg["fav_region"] = fav_region_val
                 ui_cfg["fav_fail_fallback"] = fav_fail_fallback
                 if routing_mode == "fixed_ip":
                     ui_cfg["fixed_node_id"] = fixed_node_id
