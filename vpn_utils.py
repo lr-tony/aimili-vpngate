@@ -909,6 +909,39 @@ def _deref_nuxt_payload(data: list[Any], idx: Any, depth: int = 0) -> Any:
         return {str(k): _deref_nuxt_payload(data, v, depth + 1) for k, v in val.items()}
     return val
 
+CLEANIP_CHECK_EXPLANATIONS: dict[str, dict[str, str]] = {
+    "vpn": {
+        "why": "多源风控库检测到商业 VPN 或加密隧道出口特征，隐藏了真实网络位置。",
+        "impact": "流媒体解锁、AI 订阅 (ChatGPT/Claude) 与账号安全校验通常会提高验证强度或直接拦截。",
+        "fix": "优先切换至无 VPN 标记的原生家庭宽带 (ISP) 节点。",
+    },
+    "proxy": {
+        "why": "多源检测到通用代理流量特征 (Web 代理 / SOCKS5 / HTTP / Shadowsocks / 住宅代理转发)，流量经过中间节点转发。",
+        "impact": "电商 / 支付 / 银行类业务对代理 IP 直接拒绝；注册类业务也容易被标记可疑。",
+        "fix": "停用共享代理节点，优先选择独享或 C 段活跃设备极少的原生家庭宽带。",
+    },
+    "tor": {
+        "why": "该 IP 被收录于 Tor 暗网出口节点列表中，匿名度极高且历史滥用频繁。",
+        "impact": "绝大多数主流网站、支付网关与 Cloudflare 站点会直接拦截或无限弹验证码。",
+        "fix": "立即更换非 Tor 出口的常规宽带节点。",
+    },
+    "abuse_history": {
+        "why": "滥用举报库里有用户主动举报记录，通常是扫描 / 暴破 / 垃圾邮件 / 撞库或 C 段高频爬虫行为引发。",
+        "impact": "邮件发送场景高风险 (大概率进垃圾箱)；防火墙 / WAF 类系统也会自动屏蔽或高频弹盾。",
+        "fix": "更换无近期滥用举报、且同 C 段邻居干净的低风险节点。",
+    },
+    "dnsbl": {
+        "why": "命中一个或多个 DNS 实时黑名单 (如 DroneBL / Spamhaus / SORBS)，通常是邮件滥用或开放代理触发。",
+        "impact": "邮件发送场景高度受阻 (大概率被 Gmail / Outlook / 企业邮箱拒收或丢垃圾箱)；严格账号注册易受影响。",
+        "fix": "选择未命中 DNSBL 黑名单的纯净住宅 IP。",
+    },
+    "hosting": {
+        "why": "ASN 注册类型或机房指纹库将该 IP 识别为数据中心 / 云服务器 / 托管网络 (IDC/Hosting)。",
+        "impact": "TikTok、原生流媒体、住宅风控严格的平台会将机房流量降权或拦截。",
+        "fix": "切换至网络类型为 Fixed Line ISP (家庭宽带) 或 Mobile ISP (移动网络) 的节点。",
+    },
+}
+
 def format_cleanip_cli_report(info: dict[str, Any], *, header_title: str = "CleanIP.io", footer_url: str | None = None) -> str:
     ip = str(info.get("ip") or "-")
     rdns = str(info.get("hostname") or "-")
@@ -964,12 +997,105 @@ def format_cleanip_cli_report(info: dict[str, Any], *, header_title: str = "Clea
         lines.append(f"  风控检测项      {checks_line}")
     if recommendation:
         lines.append(f"  评估建议        {recommendation}")
+
+    # Optional rich sections: 6-item audit & deduction details + positive/negative tags + 27 risk signals
+    audit_block = str(info.get("audit_breakdown_text") or "").strip()
+    if audit_block:
+        lines.extend([
+            "──────────────────────────────────────────────────────────────",
+            audit_block,
+        ])
+    signals_block = str(info.get("risk_signals_text") or "").strip()
+    if signals_block:
+        lines.extend([
+            "──────────────────────────────────────────────────────────────",
+            signals_block,
+        ])
+
     lines.extend([
         "──────────────────────────────────────────────────────────────",
         "",
         f"  {footer_url}" if footer_url else f"  完整报告 (含黑名单/端口/平台适配): https://cleanip.io/{ip}",
     ])
     return "\n".join(lines)
+
+def _format_audit_and_signals_blocks(
+    checks: list[dict[str, Any]],
+    positive_factors: list[str],
+    risk_factors: list[str],
+    hit_signals: list[dict[str, str]],
+    total_signals: int = 27,
+    unchecked_signals: int = 3,
+) -> tuple[str, str]:
+    audit_lines: list[str] = []
+    if checks:
+        total_cnt = len(checks)
+        pass_cnt = sum(1 for c in checks if c.get("status") in ("pass", "bonus"))
+        deducted = [
+            c for c in checks
+            if c.get("status") in ("fail", "warn") and _safe_int(c.get("earned"), 0) < _safe_int(c.get("max"), 0)
+        ]
+        deduct_cnt = len(deducted)
+        deduct_pts = sum(_safe_int(c.get("max"), 0) - _safe_int(c.get("earned"), 0) for c in deducted)
+        earned_sum = sum(_safe_int(c.get("earned"), 0) for c in checks)
+        max_sum = sum(0 if c.get("status") == "bonus" else _safe_int(c.get("max"), 0) for c in checks)
+
+        if deduct_cnt > 0:
+            audit_lines.append(
+                f"  📋 审核共 {total_cnt} 项   ✓ 通过 {pass_cnt}   ✗ 扣分 {deduct_cnt} 项 / 共扣 {deduct_pts} 分 (总计 {earned_sum}/{max_sum})"
+            )
+            audit_lines.append("")
+            audit_lines.append(f"  ⚠️ 扣分原因详解 ({deduct_cnt} 项):")
+            for c in deducted:
+                ckey = str(c.get("key") or "")
+                clabel = str(c.get("label") or ckey)
+                cverdict = str(c.get("verdict") or "")
+                cearned = _safe_int(c.get("earned"), 0)
+                cmax = _safe_int(c.get("max"), 0)
+                cpts = cmax - cearned
+                audit_lines.append(f"    ✗ {clabel:<12} -{cpts} 分 ({cearned}/{cmax})  | 检查结果: {cverdict}")
+                expl = CLEANIP_CHECK_EXPLANATIONS.get(ckey)
+                if expl:
+                    audit_lines.append(f"      · 为什么扣分: {expl['why']}")
+                    audit_lines.append(f"      · 影响业务场景: {expl['impact']}")
+                    audit_lines.append(f"      · 如何改善: {expl['fix']}")
+        else:
+            audit_lines.append(f"  📋 审核共 {total_cnt} 项   ✓ 全部通过 ({earned_sum}/{max_sum} 满分无扣分)")
+
+        audit_lines.append("")
+        audit_lines.append(f"  ▸ 完整审核项 ({total_cnt} 项):")
+        for c in checks:
+            st = c.get("status")
+            icon = "✓" if st in ("pass", "bonus") else ("⚠" if st == "warn" else "✗")
+            clabel = str(c.get("label") or "")
+            cverdict = str(c.get("verdict") or "")
+            cearned = _safe_int(c.get("earned"), 0)
+            cmax = _safe_int(c.get("max"), 0)
+            audit_lines.append(f"    [{icon}] {clabel:<12} {cverdict:<24} ({cearned}/{cmax})")
+
+    if positive_factors or risk_factors:
+        audit_lines.append("")
+        if positive_factors:
+            audit_lines.append("  🟢 正向信号: " + "  ".join(f"[✓ {p}]" for p in positive_factors))
+        if risk_factors:
+            audit_lines.append("  🔴 风险标签: " + "  ".join(f"[⚠ {r}]" for r in risk_factors))
+
+    sig_lines: list[str] = []
+    hit_cnt = len(hit_signals)
+    sig_lines.append(
+        f"  🎯 风险信号 · 命中 {hit_cnt} / {total_signals}"
+        + (f" (另有 {unchecked_signals} 项未检测)" if unchecked_signals > 0 else "")
+    )
+    if hit_signals:
+        for sig in hit_signals:
+            s_label = sig.get("label", "")
+            s_group = sig.get("group", "")
+            s_desc = sig.get("desc", "")
+            sig_lines.append(f"    ✗ {s_label:<10} [{s_group}] — {s_desc}")
+    else:
+        sig_lines.append(f"    ✓ 已检测的 {total_signals - unchecked_signals} 项高危风险信号全部未命中 (Clear)")
+
+    return "\n".join(audit_lines), "\n".join(sig_lines)
 
 def build_cleanip_result_from_ip_obj(ip_obj: dict[str, Any], target_ip: str) -> dict[str, Any]:
     if not isinstance(ip_obj, dict) or not (ip_obj.get("purity") or ip_obj.get("ip")):
@@ -1016,6 +1142,7 @@ def build_cleanip_result_from_ip_obj(ip_obj: dict[str, Any], target_ip: str) -> 
         "Very Clean": "极低风险",
         "Clean": "低风险",
         "Low": "低风险",
+        "Low Risk": "低风险",
         "Minimal": "极低风险",
         "Medium": "中风险",
         "High": "高风险",
@@ -1037,6 +1164,38 @@ def build_cleanip_result_from_ip_obj(ip_obj: dict[str, Any], target_ip: str) -> 
             status_icon = "✓" if chk.get("status") == "pass" else ("⚠" if chk.get("status") == "warn" else "✗")
             check_parts.append(f"{status_icon}{chk['label']}:{chk['verdict']}")
     checks_summary = " | ".join(check_parts)
+
+    pos_factors = [str(x) for x in (purity.get("positive_factors") or []) if x]
+    neg_factors = [str(x) for x in (purity.get("risk_factors") or []) if x]
+
+    hit_sigs: list[dict[str, str]] = []
+    if risk.get("is_residential_proxy"):
+        hit_sigs.append({"label": "住宅代理", "group": "匿名性", "desc": "底层像家宽，但行为像被代理网络池化的住宅出口。这类 IP 常被平台按代理或批量自动化流量处理。"})
+    elif risk.get("is_proxy"):
+        hit_sigs.append({"label": "代理", "group": "匿名性", "desc": "检测到代理出口特征，真实访问者和出口 IP 可能不一致。"})
+    if risk.get("is_vpn"):
+        hit_sigs.append({"label": "VPN", "group": "匿名性", "desc": "检测到 VPN 出口特征，会隐藏真实网络位置。"})
+    if risk.get("is_tor"):
+        hit_sigs.append({"label": "Tor", "group": "匿名性", "desc": "Tor 出口匿名性强，滥用率高，多数平台会直接拦截。"})
+    if risk.get("is_crawler") or risk.get("proxycheck_scraper"):
+        hit_sigs.append({"label": "爬虫", "group": "匿名性", "desc": "检测到自动化抓取或非正常浏览行为信号，高频访问、批量请求和弱浏览器特征会提高拦截概率。"})
+    if _safe_int(risk.get("dnsbl_count"), 0) > 0:
+        hit_sigs.append({"label": "DNSBL", "group": "黑名单", "desc": "命中邮件或网络黑名单，邮件投递、账号注册和信誉评分会受影响。"})
+    if _safe_int(risk.get("abuse_reports"), 0) > 0 and risk.get("abuse_last_reported"):
+        hit_sigs.append({"label": "近期举报", "group": "攻击", "desc": "近 30 天内仍有新的攻击举报，说明问题还在持续，不是历史遗留记录。"})
+    if _safe_int(risk.get("abuse_distinct_users"), 0) >= 3:
+        hit_sigs.append({"label": "多人举报", "group": "攻击", "desc": "有 3 个以上互不相关的用户举报过该 IP，误报的可能性很低。"})
+    if risk.get("proxycheck_compromised"):
+        hit_sigs.append({"label": "失陷设备", "group": "黑名单", "desc": "检测到设备可能已被入侵或被代理/僵尸网络滥用。"})
+
+    audit_block, sig_block = _format_audit_and_signals_blocks(
+        [c for c in checks if isinstance(c, dict)],
+        pos_factors,
+        neg_factors,
+        hit_sigs,
+        total_signals=27,
+        unchecked_signals=3,
+    )
 
     loc_parts = [str(geo.get(k) or "").strip() for k in ("country", "region", "city")]
     location_str = " · ".join([p for p in loc_parts if p]) or "-"
@@ -1074,6 +1233,8 @@ def build_cleanip_result_from_ip_obj(ip_obj: dict[str, Any], target_ip: str) -> 
         "platform_summary": platform_summary,
         "checks_summary": checks_summary,
         "recommendation": str(purity.get("recommendation") or ""),
+        "audit_breakdown_text": audit_block,
+        "risk_signals_text": sig_block,
     }
     report_text = format_cleanip_cli_report(info_for_report)
     now = time.time()
@@ -1175,8 +1336,8 @@ def detect_local_vpn_proxy_url() -> tuple[str | None, str | None]:
 
 def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     """
-    Multi-source IP purity & risk intelligence aligned with CleanIP's 6-dimension & 4-part environment model
-    (ProxyCheck.io v2 + iplocate.io + ip-api.com + ipapi.is).
+    Multi-source IP purity & risk intelligence aligned with CleanIP's 6-dimension, 6-check (32-pt) audit,
+    and 27-signal risk matrix (ProxyCheck.io v2 + iplocate.io + ip-api.com + ipapi.is).
     Queries public intelligence databases directly from the VPS without touching CleanIP or the residential VPN tunnel.
     """
     iplocate_data: dict[str, Any] = {}
@@ -1253,6 +1414,7 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     comp_obj = iplocate_data.get("company") if isinstance(iplocate_data.get("company"), dict) else {}
     priv_obj = iplocate_data.get("privacy") if isinstance(iplocate_data.get("privacy"), dict) else {}
     pc_devices = proxycheck_data.get("devices") if isinstance(proxycheck_data.get("devices"), dict) else {}
+    pc_operator = proxycheck_data.get("operator") if isinstance(proxycheck_data.get("operator"), dict) else {}
 
     geo_cc = str(
         iplocate_data.get("country_code")
@@ -1300,7 +1462,10 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     ipl_proxy = bool(priv_obj.get("is_proxy") or ipapi_is_data.get("is_proxy"))
     ipapi_proxy = bool(ipapi_com_data.get("proxy"))
     is_tor = bool(priv_obj.get("is_tor") or ipapi_is_data.get("is_tor") or "tor" in pc_type_lower)
-    is_abuser = bool(priv_obj.get("is_abuser") or ipapi_is_data.get("is_abuser") or proxycheck_data.get("compromised"))
+    is_bogon = bool(priv_obj.get("is_bogon") or ipapi_is_data.get("is_bogon"))
+    is_relay = bool(priv_obj.get("is_icloud_relay") or ipapi_is_data.get("is_relay"))
+    is_compromised = bool(proxycheck_data.get("compromised"))
+    is_abuser = bool(priv_obj.get("is_abuser") or ipapi_is_data.get("is_abuser") or is_compromised)
 
     provider_text = " ".join([
         str(asn_obj.get("name") or ""),
@@ -1399,8 +1564,6 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
 
     score = max(8, min(99, int(round(raw_score * utility_mult))))
 
-    # CleanIP residential_probability alignment:
-    # IDC = 5%, Mobile = 70% (or score if lower), Residential = score
     if is_hosting:
         res_prob = 5
     elif is_mobile:
@@ -1408,7 +1571,6 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     else:
         res_prob = score if is_native else min(65, score)
 
-    # CleanIP 4-part ip_environment alignment (reputation 0.45, neighborhood 0.20, provenance 0.20, asn_profile 0.15)
     env_reputation = score
     env_provenance = 100 if is_native else 50
     env_asn = 45 if is_hosting else 88
@@ -1430,24 +1592,138 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     )
     risk_label = "极低风险" if risk_score <= 12 else "低风险" if risk_score <= 25 else "中风险" if risk_score <= 55 else "高风险"
 
-    is_vpn_effective = bool((pc_proxy and ("vpn" in pc_type_lower or ipl_vpn)) or (anon_sources >= 2 and ipl_vpn))
-    is_proxy_effective = bool(pc_proxy or anon_sources >= 2)
+    # --- CleanIP 6-item (32-point) Audit Breakdown & 27 Risk Signals Matrix ---
+    is_res_proxy = bool(not is_hosting and pc_proxy and (high_risk_proto or pc_risk >= 50))
+    is_vpn_hit = bool(
+        (pc_proxy and ("vpn" in pc_type_lower or (is_hosting and ipl_vpn)))
+        or (not pc_proxy and anon_sources >= 2 and ipl_vpn)
+    )
+    is_vpn_warn = bool(not is_vpn_hit and (ipl_vpn or (pc_proxy and pc_type_lower == "vpn")))
+    is_proxy_hit = bool(is_res_proxy or (pc_proxy and high_risk_proto) or (ipl_proxy and ipapi_proxy))
+    is_proxy_warn = bool(not is_proxy_hit and (pc_proxy or ipl_proxy or ipapi_proxy))
+    is_crawler = bool(
+        ipapi_is_data.get("is_crawler")
+        or proxycheck_data.get("scraper")
+        or (is_res_proxy and (sub_dev >= 20 or addr_dev >= 1))
+    )
+    dnsbl_hit = bool(is_abuser or (pc_proxy and (is_hosting or sub_dev >= 30)))
+
+    # 1. VPN check (max 8)
+    if is_vpn_hit:
+        vpn_chk = {"key": "vpn", "label": "VPN 检测", "verdict": f"命中 VPN ({pc_type or 'VPN'})", "status": "fail", "earned": 0, "max": 8}
+    elif is_vpn_warn:
+        vpn_chk = {"key": "vpn", "label": "VPN 检测", "verdict": "单源疑似 VPN (其余源未确认)", "status": "warn", "earned": 6, "max": 8}
+    else:
+        vpn_chk = {"key": "vpn", "label": "VPN 检测", "verdict": "未检测到 VPN", "status": "pass", "earned": 8, "max": 8}
+
+    # 2. Proxy check (max 7)
+    if is_proxy_hit:
+        proxy_chk = {"key": "proxy", "label": "代理检测", "verdict": f"命中代理 ({'住宅代理/' + pc_type if is_res_proxy else (pc_type or 'Proxy')})", "status": "fail", "earned": 0, "max": 7}
+    elif is_proxy_warn:
+        proxy_chk = {"key": "proxy", "label": "代理检测", "verdict": "单源疑似代理特征", "status": "warn", "earned": 4, "max": 7}
+    else:
+        proxy_chk = {"key": "proxy", "label": "代理检测", "verdict": "未检测到代理", "status": "pass", "earned": 7, "max": 7}
+
+    # 3. Tor check (max 5)
+    if is_tor:
+        tor_chk = {"key": "tor", "label": "Tor 暗网检测", "verdict": "命中 Tor 出口节点", "status": "fail", "earned": 0, "max": 5}
+    else:
+        tor_chk = {"key": "tor", "label": "Tor 暗网检测", "verdict": "非 Tor 出口节点", "status": "pass", "earned": 5, "max": 5}
+
+    # 4. Abuse history check (max 5)
+    if is_abuser:
+        abuse_chk = {"key": "abuse_history", "label": "滥用历史", "verdict": f"检测到滥用或高危记录 (风险分 {pc_risk})", "status": "fail", "earned": 0, "max": 5}
+    elif pc_proxy and sub_dev >= 100:
+        abuse_chk = {"key": "abuse_history", "label": "滥用历史", "verdict": f"C段高频代理共享 ({sub_dev} 台活跃设备)", "status": "warn", "earned": 3, "max": 5}
+    else:
+        abuse_chk = {"key": "abuse_history", "label": "滥用历史", "verdict": "无明显滥用历史", "status": "pass", "earned": 5, "max": 5}
+
+    # 5. DNSBL check (max 4)
+    if is_abuser:
+        dnsbl_chk = {"key": "dnsbl", "label": "DNSBL 黑名单", "verdict": "命中多个黑名单风险信号", "status": "fail", "earned": 0, "max": 4}
+    elif dnsbl_hit:
+        dnsbl_chk = {"key": "dnsbl", "label": "DNSBL 黑名单", "verdict": "疑似命中 1 个 DNSBL/代理网段黑名单", "status": "warn", "earned": 2, "max": 4}
+    else:
+        dnsbl_chk = {"key": "dnsbl", "label": "DNSBL 黑名单", "verdict": "未命中 DNSBL", "status": "pass", "earned": 4, "max": 4}
+
+    # 6. Hosting check (max 3)
+    if is_hosting:
+        host_chk = {"key": "hosting", "label": "机房/托管检测", "verdict": "识别为机房/托管网络 (IDC)", "status": "fail", "earned": 0, "max": 3}
+    else:
+        host_chk = {"key": "hosting", "label": "机房/托管检测", "verdict": "未识别为机房托管网络", "status": "pass", "earned": 3, "max": 3}
+
+    checks_objs = [vpn_chk, proxy_chk, tor_chk, abuse_chk, dnsbl_chk, host_chk]
+    checks_summary = " | ".join(
+        f"{'✓' if c['status'] == 'pass' else ('⚠' if c['status'] == 'warn' else '✗')}{c['label']}:{c['verdict']}({c['earned']}/{c['max']})"
+        for c in checks_objs
+    )
+
+    # Positive & Risk factor tags (CleanIP style)
+    positive_factors: list[str] = []
+    if is_native:
+        positive_factors.append("IP 段登记国与定位国一致 (原生 IP)")
+    if not is_vpn_hit and not is_proxy_hit and not is_tor:
+        positive_factors.append("多源一致判定非高危匿名出口")
+    if not is_abuser:
+        positive_factors.append("长期跟踪无任何攻击行为记录")
+
+    risk_factors: list[str] = []
+    if is_res_proxy:
+        risk_factors.append("住宅代理")
+    elif is_proxy_hit:
+        risk_factors.append(f"代理服务 ({pc_type or 'Proxy'})")
+    elif is_proxy_warn:
+        risk_factors.append("代理服务 (单源标记, 其余源未确认)")
+    if is_vpn_hit:
+        risk_factors.append("VPN 服务")
+    elif is_vpn_warn:
+        risk_factors.append("VPN 服务 (单源标记, 其余源未确认)")
+    if is_crawler:
+        risk_factors.append("检测到爬虫行为")
+    if is_hosting:
+        risk_factors.append("数据中心 / 机房网络")
+    if is_abuser:
+        risk_factors.append("存在公开滥用/失陷记录")
+
+    # 27 Risk Signals Matrix
+    hit_signals: list[dict[str, str]] = []
+    if is_res_proxy:
+        hit_signals.append({"label": "住宅代理", "group": "匿名性", "desc": "底层像家宽，但行为像被代理网络池化的住宅出口。这类 IP 常被平台按代理或批量自动化流量处理。"})
+    elif is_proxy_hit:
+        hit_signals.append({"label": "代理", "group": "匿名性", "desc": "检测到代理出口特征，真实访问者和出口 IP 可能不一致，登录、注册和支付场景会被风控重点复查。"})
+    if is_vpn_hit:
+        hit_signals.append({"label": "VPN", "group": "匿名性", "desc": "检测到 VPN 出口特征，会隐藏真实网络位置，账号安全、订阅和风控严格的平台通常会提高验证强度。"})
+    if is_tor:
+        hit_signals.append({"label": "Tor", "group": "匿名性", "desc": "Tor 出口匿名性强，滥用率高，多数平台会直接拦截或限制关键业务操作。"})
+    if is_relay:
+        hit_signals.append({"label": "中继", "group": "匿名性", "desc": "隐私中继会隐藏真实网络位置，但地理和账号一致性判断会变弱。"})
+    if is_crawler:
+        hit_signals.append({"label": "爬虫", "group": "匿名性", "desc": "检测到自动化抓取或非正常浏览行为信号，高频访问、批量请求和弱浏览器特征会提高拦截概率。"})
+    if dnsbl_hit:
+        hit_signals.append({"label": "DNSBL", "group": "黑名单", "desc": "命中邮件或网络黑名单，邮件投递、账号注册和信誉评分会受影响。"})
+    if is_compromised:
+        hit_signals.append({"label": "失陷设备", "group": "黑名单", "desc": "检测到设备可能已被入侵或被代理/僵尸网络滥用，账号和支付场景应直接规避。"})
+    if is_abuser:
+        hit_signals.append({"label": "滥用", "group": "滥用", "desc": "公开滥用记录或多源风险分显示异常。"})
+        hit_signals.append({"label": "近期举报", "group": "攻击", "desc": "近 30 天内仍有新的攻击或滥用举报，说明问题还在持续。"})
+    if pc_risk >= 75:
+        hit_signals.append({"label": "威胁情报", "group": "滥用", "desc": "威胁情报源将该 IP 标记为高风险可疑出口。"})
+    if is_bogon:
+        hit_signals.append({"label": "Bogon", "group": "黑名单", "desc": "该地址属于保留或不应出现在公网路由中的地址段。"})
+
+    audit_block, sig_block = _format_audit_and_signals_blocks(
+        checks_objs,
+        positive_factors,
+        risk_factors,
+        hit_signals,
+        total_signals=27,
+        unchecked_signals=3,
+    )
 
     ai_score = max(15, min(98, score if not is_hosting else max(55, score - 10)))
-    tiktok_score = max(10, min(98, score if (is_native and not is_hosting and not is_proxy_effective) else max(45, score - 12)))
-    netflix_score = max(15, min(98, score if (is_native and not is_hosting and not is_proxy_effective) else max(50, score - 10)))
+    tiktok_score = max(10, min(98, score if (is_native and not is_hosting and not is_proxy_hit) else max(45, score - 12)))
+    netflix_score = max(15, min(98, score if (is_native and not is_hosting and not is_proxy_hit) else max(50, score - 10)))
     platform_summary = f"AI {ai_score} · TikTok {tiktok_score} · 流媒体 {netflix_score} · YouTube {min(99, score + 3)} · 支付 {score}"
-
-    proxy_verdict = f"检测到代理/隧道 ({pc_type or 'Proxy'}, 风险 {pc_risk})" if pc_proxy else ("多源标记代理" if is_proxy_effective else "未检测到代理")
-    vpn_verdict = f"检测到 VPN ({pc_type or 'VPN'})" if is_vpn_effective else ("单源疑似未确认(不扣分)" if (ipl_vpn or ipapi_proxy) else "未检测到 VPN")
-    checks_list = [
-        f"{'⚠' if is_vpn_effective else '✓'}VPN 检测:{vpn_verdict}",
-        f"{'⚠' if is_proxy_effective else '✓'}代理检测:{proxy_verdict}",
-        f"{'✗' if is_tor else '✓'}Tor 暗网检测:{'命中 Tor 节点' if is_tor else '非 Tor 出口节点'}",
-        f"{'✗' if is_abuser else '✓'}滥用历史:{'存在近期滥用记录' if is_abuser else f'无明显滥用 (C段活跃设备:{sub_dev})'}",
-        f"{'⚠' if is_hosting else '✓'}机房/托管检测:{'识别为数据中心/托管网络' if is_hosting else '家庭宽带/ISP 终端网络'}",
-    ]
-    checks_summary = " | ".join(checks_list)
 
     country_zh = COUNTRY_TRANSLATIONS.get(
         str(ipapi_com_data.get("country") or iplocate_data.get("country") or proxycheck_data.get("country") or ""),
@@ -1471,7 +1747,7 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     elif score >= 70:
         recommendation = "多源交叉验证(已对齐CleanIP模型)：该 IP 整体较干净，存在轻度单源代理/共享信号，适合常规业务场景。"
     else:
-        recommendation = f"多源交叉验证(已对齐CleanIP模型)：检测到共享代理/隧道特征 ({pc_type or 'Residential Proxy'}, C段活跃邻居 {sub_dev} 个)，严格风控平台可能触发验证。"
+        recommendation = f"多源交叉验证(已对齐CleanIP模型)：检测到共享代理/隧道特征 ({pc_type or 'Residential Proxy'}, C段活跃邻居 {sub_dev} 个)，建议用于低敏业务并持续观察。"
 
     summary_parts = [
         f"三源评分 {score} ({grade})",
@@ -1502,10 +1778,12 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
         "platform_summary": platform_summary,
         "checks_summary": checks_summary,
         "recommendation": recommendation,
+        "audit_breakdown_text": audit_block,
+        "risk_signals_text": sig_block,
     }
     report_text = format_cleanip_cli_report(
         info_for_report,
-        header_title="多源风控情报联合评估 · CleanIP 6维对齐模型 (ProxyCheck + iplocate + ip-api + ipapi.is)",
+        header_title="多源风控情报联合评估 · CleanIP 6维+32分审核对齐模型",
         footer_url=f"数据源: ProxyCheck.io v2 (同源代理/设备指纹) · iplocate.io · ip-api.com · ipapi.is | CleanIP: https://cleanip.io/{target_ip}",
     )
     now = time.time()
