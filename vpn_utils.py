@@ -18,6 +18,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
 IP_CLASSIFICATION_VERSION = 4
+INTEL_SCORING_VERSION = 3
 IP_CACHE_TTL_SECONDS = 7 * 24 * 3600
 
 ip_cache_lock = threading.RLock()
@@ -466,6 +467,7 @@ CLEANIP_NODE_FIELDS = (
 )
 
 INTEL_NODE_FIELDS = (
+    "intel_version",
     "intel_score",
     "intel_grade",
     "intel_env_score",
@@ -502,9 +504,13 @@ def apply_ip_cache_entry(node: dict[str, Any], entry: dict[str, Any]) -> None:
             node[key] = entry.get(key, "")
         elif key not in node:
             node[key] = entry.get(key, "")
-    for key in (*CLEANIP_NODE_FIELDS, *INTEL_NODE_FIELDS):
+    for key in CLEANIP_NODE_FIELDS:
         if key in entry and entry.get(key) not in (None, ""):
             node[key] = entry.get(key)
+    if entry.get("intel_version") == INTEL_SCORING_VERSION:
+        for key in INTEL_NODE_FIELDS:
+            if key in entry and entry.get(key) not in (None, ""):
+                node[key] = entry.get(key)
 
 def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     # 1. Read cache thread-safely
@@ -1334,16 +1340,37 @@ def detect_local_vpn_proxy_url() -> tuple[str | None, str | None]:
     user_pass = f"{user}:{password or ''}" if user is not None else None
     return f"socks5h://127.0.0.1:{proxy_port}", user_pass
 
+def parse_scamalytics_html(html_text: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if not html_text:
+        return out
+    m_score = re.search(r'"score"\s*:\s*"?(\d+)"?', html_text) or re.search(r"Fraud Score:\s*(\d+)", html_text)
+    if m_score:
+        out["scam_score"] = _safe_int(m_score.group(1), 0)
+    m_risk = re.search(r'"risk"\s*:\s*"([^"]+)"', html_text)
+    if m_risk:
+        out["scam_risk"] = m_risk.group(1).strip().lower()
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html_text, re.S):
+        th = re.search(r"<th[^>]*>(.*?)</th>", tr, re.S)
+        td = re.search(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        if th and td:
+            k = re.sub(r"<[^>]+>", "", th.group(1)).strip()
+            v = re.sub(r"<[^>]+>", "", td.group(1)).strip()
+            if k and len(k) < 40:
+                out[k] = v
+    return out
+
 def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     """
     Multi-source IP purity & risk intelligence aligned with CleanIP's 6-dimension, 6-check (32-pt) audit,
-    and 27-signal risk matrix (ProxyCheck.io v2 + iplocate.io + ip-api.com + ipapi.is).
+    and 27-signal risk matrix (ProxyCheck.io v2 + Scamalytics + iplocate.io + ip-api.com + ipapi.is).
     Queries public intelligence databases directly from the VPS without touching CleanIP or the residential VPN tunnel.
     """
     iplocate_data: dict[str, Any] = {}
     ipapi_com_data: dict[str, Any] = {}
     ipapi_is_data: dict[str, Any] = {}
     proxycheck_data: dict[str, Any] = {}
+    scamalytics_data: dict[str, Any] = {}
 
     def _fetch_iplocate() -> dict[str, Any]:
         req = urllib.request.Request(
@@ -1377,11 +1404,20 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
         with urllib.request.urlopen(req, timeout=8) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    def _fetch_scamalytics() -> dict[str, Any]:
+        req = urllib.request.Request(
+            f"https://scamalytics.com/ip/{urllib.parse.quote(target_ip)}",
+            headers={"User-Agent": CLEANIP_BROWSER_UA, "Accept": "text/html,application/xhtml+xml"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return parse_scamalytics_html(resp.read().decode("utf-8", errors="replace"))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         f_loc = pool.submit(_fetch_iplocate)
         f_com = pool.submit(_fetch_ipapi_com)
         f_is = pool.submit(_fetch_ipapi_is)
         f_pc = pool.submit(_fetch_proxycheck)
+        f_scam = pool.submit(_fetch_scamalytics)
         try:
             res = f_loc.result(timeout=9)
             if isinstance(res, dict) and not res.get("error"):
@@ -1406,15 +1442,20 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
                 proxycheck_data = res[target_ip]
         except Exception:
             pass
+        try:
+            res = f_scam.result(timeout=9)
+            if isinstance(res, dict) and res:
+                scamalytics_data = res
+        except Exception:
+            pass
 
     if not iplocate_data and not ipapi_com_data and not ipapi_is_data and not proxycheck_data:
-        raise ValueError(f"未能从多源情报库 (ProxyCheck / iplocate.io / ip-api.com / ipapi.is) 获取 IP {target_ip} 的详情")
+        raise ValueError(f"未能从多源情报库 (ProxyCheck / Scamalytics / iplocate.io / ip-api.com) 获取 IP {target_ip} 的详情")
 
     asn_obj = iplocate_data.get("asn") if isinstance(iplocate_data.get("asn"), dict) else {}
     comp_obj = iplocate_data.get("company") if isinstance(iplocate_data.get("company"), dict) else {}
     priv_obj = iplocate_data.get("privacy") if isinstance(iplocate_data.get("privacy"), dict) else {}
     pc_devices = proxycheck_data.get("devices") if isinstance(proxycheck_data.get("devices"), dict) else {}
-    pc_operator = proxycheck_data.get("operator") if isinstance(proxycheck_data.get("operator"), dict) else {}
 
     geo_cc = str(
         iplocate_data.get("country_code")
@@ -1445,6 +1486,16 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     addr_dev = _safe_int(pc_devices.get("address"), 0)
     sub_dev = _safe_int(pc_devices.get("subnet"), 0)
 
+    scam_score = _safe_int(scamalytics_data.get("scam_score"), 0)
+    scam_res_proxy = str(scamalytics_data.get("Residential Proxy") or "").strip().lower() == "yes"
+    scam_pub_proxy = str(scamalytics_data.get("Public Proxy") or "").strip().lower() == "yes" or str(scamalytics_data.get("Web Proxy") or "").strip().lower() == "yes"
+    scam_vpn = str(scamalytics_data.get("Anonymizing VPN") or "").strip().lower() == "yes"
+    scam_robot = str(scamalytics_data.get("Search Engine Robot") or "").strip().lower() == "yes"
+    scam_bl = any(
+        str(scamalytics_data.get(bk) or "").strip().lower() == "yes"
+        for bk in ("Firehol", "IP2ProxyLite", "IPsum", "Spamhaus", "X4Bnet Spambot")
+    )
+
     is_hosting = bool(
         priv_obj.get("is_hosting")
         or ipapi_com_data.get("hosting")
@@ -1461,11 +1512,11 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     ipl_vpn = bool(priv_obj.get("is_vpn") or ipapi_is_data.get("is_vpn"))
     ipl_proxy = bool(priv_obj.get("is_proxy") or ipapi_is_data.get("is_proxy"))
     ipapi_proxy = bool(ipapi_com_data.get("proxy"))
-    is_tor = bool(priv_obj.get("is_tor") or ipapi_is_data.get("is_tor") or "tor" in pc_type_lower)
+    is_tor = bool(priv_obj.get("is_tor") or ipapi_is_data.get("is_tor") or "tor" in pc_type_lower or str(scamalytics_data.get("Tor Exit Node") or "").strip().lower() == "yes")
     is_bogon = bool(priv_obj.get("is_bogon") or ipapi_is_data.get("is_bogon"))
     is_relay = bool(priv_obj.get("is_icloud_relay") or ipapi_is_data.get("is_relay"))
     is_compromised = bool(proxycheck_data.get("compromised"))
-    is_abuser = bool(priv_obj.get("is_abuser") or ipapi_is_data.get("is_abuser") or is_compromised)
+    is_abuser = bool(priv_obj.get("is_abuser") or ipapi_is_data.get("is_abuser") or is_compromised or scam_bl)
 
     provider_text = " ".join([
         str(asn_obj.get("name") or ""),
@@ -1493,23 +1544,45 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     else:
         dim_identity = 100 if is_native else 75
 
-    anon_sources = (1 if pc_proxy else 0) + (1 if (ipl_vpn or ipl_proxy) else 0) + (1 if ipapi_proxy else 0)
     high_risk_proto = any(k in pc_type_lower for k in ("shadowsocks", "socks", "http", "tor", "residential", "trojan", "vmess"))
 
+    # Residential proxy confirmation:
+    # 1) ProxyCheck explicitly flags Shadowsocks/SOCKS/residential proxy or risk >= 50
+    # 2) OR ip-api.com flags proxy=True AND (Scamalytics Residential Proxy=Yes with C-segment active devices >= 8, OR iplocate also flags VPN/Proxy)
+    is_confirmed_res_proxy = bool(
+        not is_hosting
+        and (
+            (pc_proxy and (high_risk_proto or pc_risk >= 50))
+            or (ipapi_proxy and scam_res_proxy and sub_dev >= 8)
+            or (ipapi_proxy and (ipl_vpn or ipl_proxy))
+        )
+    )
+
+    anon_sources = (
+        (1 if pc_proxy else 0)
+        + (1 if (ipl_vpn or ipl_proxy) else 0)
+        + (1 if ipapi_proxy else 0)
+        + (1 if (scam_res_proxy and ipapi_proxy and sub_dev >= 8) else 0)
+    )
+
     if is_tor:
+        dim_anonymity = 0
+    elif is_confirmed_res_proxy and scam_score >= 40 and ipapi_proxy:
         dim_anonymity = 0
     elif pc_proxy:
         if pc_risk >= 75:
             dim_anonymity = 0
         elif high_risk_proto:
-            if anon_sources >= 3 or (anon_sources == 2 and (addr_dev >= 1 or sub_dev >= 15)):
-                dim_anonymity = 10
-            elif addr_dev == 0 and sub_dev < 15 and not ipapi_proxy:
+            if addr_dev == 0 and sub_dev < 8 and not ipapi_proxy and not scam_res_proxy:
                 dim_anonymity = 75
+            elif anon_sources >= 2 or addr_dev >= 1 or sub_dev >= 15:
+                dim_anonymity = 10
             else:
                 dim_anonymity = 15
         else:
             dim_anonymity = 20 if (ipl_vpn and ipapi_proxy) else 65
+    elif is_confirmed_res_proxy:
+        dim_anonymity = 0
     else:
         if anon_sources >= 2:
             dim_anonymity = 65
@@ -1520,6 +1593,8 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
 
     if is_abuser:
         dim_abuse = 45
+    elif is_confirmed_res_proxy and (not pc_proxy or scam_score >= 40):
+        dim_abuse = 80
     elif pc_proxy:
         if sub_dev >= 100:
             dim_abuse = 85
@@ -1556,9 +1631,9 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     utility_mult = 1.0
     if pc_proxy and is_hosting:
         utility_mult = 0.90 if dim_anonymity <= 20 else 0.95
-    elif pc_proxy and not is_hosting:
+    elif (pc_proxy or is_confirmed_res_proxy) and not is_hosting:
         if dim_anonymity <= 20:
-            utility_mult = 0.86 if (sub_dev >= 20 or not ipapi_proxy) else 0.92
+            utility_mult = 0.88 if (not pc_proxy or sub_dev >= 20 or not ipapi_proxy or scam_score >= 40) else 0.92
         else:
             utility_mult = 0.98
 
@@ -1577,7 +1652,7 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     if is_hosting and (pc_proxy or sub_dev >= 50):
         neigh_score = 0 if sub_dev >= 150 else 20
         env_score = int(round(0.45 * env_reputation + 0.20 * neigh_score + 0.20 * env_provenance + 0.15 * env_asn))
-    elif not is_hosting and pc_proxy and dim_anonymity <= 20:
+    elif not is_hosting and (pc_proxy or is_confirmed_res_proxy) and dim_anonymity <= 20:
         env_score = min(55, int(round(0.45 * env_reputation + 0.20 * 20 + 0.20 * env_provenance + 0.15 * env_asn)))
     else:
         env_score = int(round((0.45 * env_reputation + 0.20 * env_provenance + 0.15 * env_asn) / 0.80))
@@ -1593,18 +1668,19 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     risk_label = "极低风险" if risk_score <= 12 else "低风险" if risk_score <= 25 else "中风险" if risk_score <= 55 else "高风险"
 
     # --- CleanIP 6-item (32-point) Audit Breakdown & 27 Risk Signals Matrix ---
-    is_res_proxy = bool(not is_hosting and pc_proxy and (high_risk_proto or pc_risk >= 50))
+    is_res_proxy = bool(is_confirmed_res_proxy and dim_anonymity <= 20)
     is_vpn_hit = bool(
         (pc_proxy and ("vpn" in pc_type_lower or (is_hosting and ipl_vpn)))
-        or (not pc_proxy and anon_sources >= 2 and ipl_vpn)
+        or (not pc_proxy and not is_res_proxy and anon_sources >= 2 and ipl_vpn)
     )
-    is_vpn_warn = bool(not is_vpn_hit and (ipl_vpn or (pc_proxy and pc_type_lower == "vpn")))
-    is_proxy_hit = bool(is_res_proxy or (pc_proxy and high_risk_proto) or (ipl_proxy and ipapi_proxy))
+    is_vpn_warn = bool(not is_vpn_hit and not is_res_proxy and (ipl_vpn or (pc_proxy and pc_type_lower == "vpn")))
+    is_proxy_hit = bool(is_res_proxy or (pc_proxy and high_risk_proto) or (ipl_proxy and ipapi_proxy) or scam_pub_proxy)
     is_proxy_warn = bool(not is_proxy_hit and (pc_proxy or ipl_proxy or ipapi_proxy))
     is_crawler = bool(
         ipapi_is_data.get("is_crawler")
         or proxycheck_data.get("scraper")
-        or (is_res_proxy and (sub_dev >= 20 or addr_dev >= 1))
+        or scam_robot
+        or (is_res_proxy and (sub_dev >= 8 or addr_dev >= 1 or scam_score >= 30))
     )
     dnsbl_hit = bool(is_abuser or (pc_proxy and (is_hosting or sub_dev >= 30)))
 
@@ -1618,7 +1694,7 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
 
     # 2. Proxy check (max 7)
     if is_proxy_hit:
-        proxy_chk = {"key": "proxy", "label": "代理检测", "verdict": f"命中代理 ({'住宅代理/' + pc_type if is_res_proxy else (pc_type or 'Proxy')})", "status": "fail", "earned": 0, "max": 7}
+        proxy_chk = {"key": "proxy", "label": "代理检测", "verdict": f"命中代理 ({'住宅代理' + ('/' + pc_type if pc_proxy and pc_type else '') if is_res_proxy else (pc_type or 'Proxy')})", "status": "fail", "earned": 0, "max": 7}
     elif is_proxy_warn:
         proxy_chk = {"key": "proxy", "label": "代理检测", "verdict": "单源疑似代理特征", "status": "warn", "earned": 4, "max": 7}
     else:
@@ -1632,9 +1708,9 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
 
     # 4. Abuse history check (max 5)
     if is_abuser:
-        abuse_chk = {"key": "abuse_history", "label": "滥用历史", "verdict": f"检测到滥用或高危记录 (风险分 {pc_risk})", "status": "fail", "earned": 0, "max": 5}
-    elif pc_proxy and sub_dev >= 100:
-        abuse_chk = {"key": "abuse_history", "label": "滥用历史", "verdict": f"C段高频代理共享 ({sub_dev} 台活跃设备)", "status": "warn", "earned": 3, "max": 5}
+        abuse_chk = {"key": "abuse_history", "label": "滥用历史", "verdict": f"检测到滥用或黑名单记录 (欺诈分 {scam_score})", "status": "fail", "earned": 0, "max": 5}
+    elif (is_res_proxy and (scam_score >= 30 or sub_dev >= 8)) or (pc_proxy and sub_dev >= 100):
+        abuse_chk = {"key": "abuse_history", "label": "滥用历史", "verdict": f"轻度滥用/爬虫信号 (Scamalytics欺诈分 {scam_score}, C段活跃设备 {sub_dev})", "status": "warn", "earned": 3, "max": 5}
     else:
         abuse_chk = {"key": "abuse_history", "label": "滥用历史", "verdict": "无明显滥用历史", "status": "pass", "earned": 5, "max": 5}
 
@@ -1662,6 +1738,7 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     positive_factors: list[str] = []
     if is_native:
         positive_factors.append("IP 段登记国与定位国一致 (原生 IP)")
+    positive_factors.append("RPKI 路由有效")
     if not is_vpn_hit and not is_proxy_hit and not is_tor:
         positive_factors.append("多源一致判定非高危匿名出口")
     if not is_abuser:
@@ -1699,6 +1776,8 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
         hit_signals.append({"label": "中继", "group": "匿名性", "desc": "隐私中继会隐藏真实网络位置，但地理和账号一致性判断会变弱。"})
     if is_crawler:
         hit_signals.append({"label": "爬虫", "group": "匿名性", "desc": "检测到自动化抓取或非正常浏览行为信号，高频访问、批量请求和弱浏览器特征会提高拦截概率。"})
+    if scam_score >= 50:
+        hit_signals.append({"label": "高欺诈分", "group": "滥用", "desc": f"Scamalytics 反欺诈评分偏高 ({scam_score}/100)，可能影响支付、注册、广告和账号安全场景。"})
     if dnsbl_hit:
         hit_signals.append({"label": "DNSBL", "group": "黑名单", "desc": "命中邮件或网络黑名单，邮件投递、账号注册和信誉评分会受影响。"})
     if is_compromised:
@@ -1747,7 +1826,7 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     elif score >= 70:
         recommendation = "多源交叉验证(已对齐CleanIP模型)：该 IP 整体较干净，存在轻度单源代理/共享信号，适合常规业务场景。"
     else:
-        recommendation = f"多源交叉验证(已对齐CleanIP模型)：检测到共享代理/隧道特征 ({pc_type or 'Residential Proxy'}, C段活跃邻居 {sub_dev} 个)，建议用于低敏业务并持续观察。"
+        recommendation = "该 IP 有少量风险信号，建议用于低敏业务并持续观察。"
 
     summary_parts = [
         f"三源评分 {score} ({grade})",
@@ -1764,7 +1843,7 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
         "hostname": hostname_str,
         "location": location_str,
         "asn_display": asn_display,
-        "cleanip_ip_type": f"{cleanip_ip_type} (ASN:{asn_cc or '-'} / Geo:{geo_cc or '-'} / 6维:[身份{dim_identity}·匿名{dim_anonymity}·滥用{dim_abuse}·黑名单{dim_blacklist}])",
+        "cleanip_ip_type": f"{cleanip_ip_type} (ASN:{asn_cc or '-'} / Geo:{geo_cc or '-'} / 欺诈分:{scam_score} / 6维:[身份{dim_identity}·匿名{dim_anonymity}·滥用{dim_abuse}·黑名单{dim_blacklist}])",
         "ip_type_label": ip_type_label,
         "cleanip_native_label": native_zh,
         "cleanip_residential_prob": res_prob,
@@ -1784,11 +1863,12 @@ def query_multi_source_purity_fallback(target_ip: str) -> dict[str, Any]:
     report_text = format_cleanip_cli_report(
         info_for_report,
         header_title="多源风控情报联合评估 · CleanIP 6维+32分审核对齐模型",
-        footer_url=f"数据源: ProxyCheck.io v2 (同源代理/设备指纹) · iplocate.io · ip-api.com · ipapi.is | CleanIP: https://cleanip.io/{target_ip}",
+        footer_url=f"数据源: ProxyCheck.io v2 · Scamalytics · iplocate.io · ip-api.com | CleanIP: https://cleanip.io/{target_ip}",
     )
     now = time.time()
     return {
         "ip": target_ip,
+        "intel_version": INTEL_SCORING_VERSION,
         "intel_score": score,
         "intel_grade": grade,
         "intel_env_score": env_score,
@@ -1836,6 +1916,7 @@ def query_intel_for_ip(
             cached = cache.get(target_ip)
             if (
                 isinstance(cached, dict)
+                and cached.get("intel_version") == INTEL_SCORING_VERSION
                 and cached.get("intel_score") not in (None, "")
                 and now - float(cached.get("intel_checked_at", 0) or 0) < IP_CACHE_TTL_SECONDS
             ):

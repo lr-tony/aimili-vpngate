@@ -6439,7 +6439,7 @@ async function cancelBatchAvailabilityTest() {
   }
 }
 
-async function startBatchCleanIpWithIds(targetIds, source = "cleanip") {
+async function startBatchCleanIpWithIds(targetIds, source = "cleanip", force = false) {
   if (!targetIds || !targetIds.length) {
     alert("请先勾选要检测的节点。");
     return;
@@ -6448,7 +6448,7 @@ async function startBatchCleanIpWithIds(targetIds, source = "cleanip") {
     const response = await fetchWithTimeout("./api/check_cleanip_batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: targetIds, source: source })
+      body: JSON.stringify({ ids: targetIds, source: source, force: force })
     }, 25000);
     const result = await readJsonResponse(response, "启动批量检测失败");
     if (result.ok) {
@@ -6467,7 +6467,7 @@ async function runBatchCleanIpCheck() {
 
 async function runBatchIntelCheck() {
   const ids = getEffectiveTargetNodeIds(15);
-  await startBatchCleanIpWithIds(ids, "intel");
+  await startBatchCleanIpWithIds(ids, "intel", true);
 }
 
 async function batchCheckFavoritesCleanIp() {
@@ -6489,7 +6489,7 @@ async function batchCheckFavoritesIntel() {
   }
   favIds.forEach(id => selectedNodeIds.add(id));
   render();
-  await startBatchCleanIpWithIds(favIds, "intel");
+  await startBatchCleanIpWithIds(favIds, "intel", true);
 }
 
 let cleanIpPollInterval = null;
@@ -8064,10 +8064,17 @@ class Handler(BaseHTTPRequestHandler):
             for n in nodes:
                 ip_key = str(n.get("ip") or n.get("remote_host") or "").strip()
                 cached_entry = ip_cache.get(ip_key) if ip_key and isinstance(ip_cache, dict) else None
+                if n.get("intel_version") != vpn_utils.INTEL_SCORING_VERSION:
+                    for ik in vpn_utils.INTEL_NODE_FIELDS:
+                        n.pop(ik, None)
                 if isinstance(cached_entry, dict):
-                    for ck in (*vpn_utils.CLEANIP_NODE_FIELDS, *vpn_utils.INTEL_NODE_FIELDS):
+                    for ck in vpn_utils.CLEANIP_NODE_FIELDS:
                         if n.get(ck) in (None, "") and cached_entry.get(ck) not in (None, ""):
                             n[ck] = cached_entry[ck]
+                    if cached_entry.get("intel_version") == vpn_utils.INTEL_SCORING_VERSION:
+                        for ik in vpn_utils.INTEL_NODE_FIELDS:
+                            if n.get(ik) in (None, "") and cached_entry.get(ik) not in (None, ""):
+                                n[ik] = cached_entry[ik]
             connection_state = get_state()
             connection_ready = connection_ready_for_ui(connection_state)
             active_node = next((n for n in nodes if connection_ready and n.get("id") == active_openvpn_node_id), None)
