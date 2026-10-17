@@ -3315,6 +3315,593 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       transform: none !important;
     }
 
+
+    /* === Opus CloudPulse / Linear Design System Upgrade === */
+    :root {
+      --bg-dark: #07080b;
+      --bg-surface: rgba(18, 20, 27, 0.94);
+      --bg-surface-hover: rgba(28, 31, 41, 0.94);
+      --surface-solid: #11131a;
+      --border-color: rgba(255, 255, 255, 0.075);
+      --border-color-hover: rgba(124, 131, 255, 0.42);
+      --text-primary: #ededf0;
+      --text-secondary: #9ea3b0;
+      --text-muted: #6c707e;
+      --primary: #7c83ff;
+      --primary-gradient: linear-gradient(180deg, #8d93ff 0%, #636af2 100%);
+      --primary-hover: linear-gradient(180deg, #9aa0ff 0%, #6f76f6 100%);
+      --success: #34d399;
+      --success-gradient: linear-gradient(180deg, #34d399 0%, #10b981 100%);
+      --danger: #f87171;
+      --danger-gradient: linear-gradient(180deg, #fb7185 0%, #e11d48 100%);
+      --warning: #fbbf24;
+      --warning-gradient: linear-gradient(180deg, #fbbf24 0%, #d97706 100%);
+      --cyan: #22d3ee;
+      --violet: #a78bfa;
+      --blue: #60a5fa;
+      --g-ap: #2dd4bf;
+      --g-a: #4ade80;
+      --g-b: #60a5fa;
+      --g-c: #fbbf24;
+      --g-d: #f87171;
+      --active-row-bg: rgba(96, 165, 250, 0.065);
+      --active-row-border: rgba(96, 165, 250, 0.28);
+      --card-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 12px 32px rgba(0, 0, 0, 0.34);
+      color-scheme: dark;
+    }
+
+    html[data-theme="light"] {
+      --bg-dark: #f4f5f8;
+      --bg-surface: rgba(255, 255, 255, 0.96);
+      --bg-surface-hover: rgba(248, 250, 252, 0.98);
+      --surface-solid: #ffffff;
+      --border-color: rgba(15, 23, 42, 0.085);
+      --border-color-hover: rgba(91, 97, 240, 0.38);
+      --text-primary: #0f1117;
+      --text-secondary: #525866;
+      --text-muted: #848a98;
+      --primary: #5b61f0;
+      --primary-gradient: linear-gradient(180deg, #6e74f8 0%, #5258e8 100%);
+      --primary-hover: linear-gradient(180deg, #5f65f2 0%, #464cd8 100%);
+      --success: #059669;
+      --danger: #dc2626;
+      --warning: #d97706;
+      --cyan: #0891b2;
+      --violet: #7c3aed;
+      --blue: #2563eb;
+      --g-ap: #0d9488;
+      --g-a: #16a34a;
+      --g-b: #2563eb;
+      --g-c: #b45309;
+      --g-d: #dc2626;
+      --active-row-bg: rgba(37, 99, 235, 0.055);
+      --active-row-border: rgba(37, 99, 235, 0.24);
+      --card-shadow: 0 1px 2px rgba(15, 18, 30, 0.04), 0 10px 28px rgba(15, 18, 30, 0.06);
+      color-scheme: light;
+    }
+
+    body {
+      position: relative;
+      overflow-x: hidden;
+      transition: background-color 0.25s ease, color 0.25s ease;
+    }
+
+    .bg-fx {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      background:
+        radial-gradient(920px 500px at 10% -10%, rgba(124, 131, 255, 0.13), transparent 60%),
+        radial-gradient(840px 460px at 95% -12%, rgba(34, 211, 238, 0.07), transparent 62%);
+    }
+    .bg-fx::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.028) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
+      background-size: 44px 44px;
+      -webkit-mask-image: radial-gradient(ellipse 75% 45% at 50% 0%, #000 20%, transparent 75%);
+      mask-image: radial-gradient(ellipse 75% 45% at 50% 0%, #000 20%, transparent 75%);
+    }
+    html[data-theme="light"] .bg-fx::after {
+      background-image:
+        linear-gradient(rgba(15, 18, 30, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(15, 18, 30, 0.04) 1px, transparent 1px);
+    }
+
+    header, main {
+      position: relative;
+      z-index: 1;
+    }
+
+    header {
+      padding: 12px 28px;
+      background: var(--bg-surface);
+      box-shadow: 0 1px 0 var(--border-color);
+    }
+
+    .brand {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .brand-logo-box {
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      display: inline-grid;
+      place-items: center;
+      background: linear-gradient(135deg, #7c83ff 0%, #5b8cff 48%, #22d3ee 100%);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), 0 4px 14px rgba(124, 131, 255, 0.32);
+      color: #ffffff;
+      flex-shrink: 0;
+    }
+
+    h1 {
+      font-size: 16px;
+      font-weight: 600;
+      background: none;
+      -webkit-text-fill-color: var(--text-primary);
+      color: var(--text-primary);
+      letter-spacing: -0.02em;
+      gap: 10px;
+    }
+
+    .status {
+      margin-top: 0;
+      height: 28px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(52, 211, 153, 0.25);
+      background: rgba(52, 211, 153, 0.07);
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .theme-toggle-btn {
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-color);
+      color: var(--text-secondary);
+    }
+    .theme-toggle-btn:hover {
+      color: var(--text-primary);
+      border-color: var(--border-color-hover);
+    }
+
+    /* KPI Overview Strip */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+    .kpi-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: 14px;
+      padding: 14px 16px;
+      box-shadow: var(--card-shadow);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+    .kpi-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .kpi-val {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--text-primary);
+      letter-spacing: -0.03em;
+      font-family: 'JetBrains Mono', Consolas, monospace;
+    }
+    .kpi-unit {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-weight: 500;
+      margin-left: 4px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .kpi-sub {
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .kpi-bar {
+      height: 4px;
+      border-radius: 99px;
+      background: rgba(255, 255, 255, 0.07);
+      overflow: hidden;
+      margin-top: 6px;
+    }
+    .kpi-bar > i {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--success);
+      transition: width 0.3s ease;
+    }
+    .kpi-dist {
+      display: flex;
+      height: 4px;
+      border-radius: 99px;
+      overflow: hidden;
+      gap: 2px;
+      margin-top: 6px;
+      background: rgba(255, 255, 255, 0.05);
+    }
+    .kpi-dist > i {
+      display: block;
+      height: 100%;
+    }
+
+    /* Hero Active Card */
+    .active-card {
+      position: relative;
+      overflow: hidden;
+      background: var(--bg-surface);
+      border: 1px solid rgba(124, 131, 255, 0.28);
+      border-radius: 16px;
+      padding: 20px 24px;
+      box-shadow: var(--card-shadow);
+    }
+    .active-card::before {
+      content: "";
+      position: absolute;
+      width: 480px;
+      height: 480px;
+      left: -140px;
+      top: -320px;
+      background: radial-gradient(circle, rgba(124, 131, 255, 0.16), transparent 65%);
+      pointer-events: none;
+    }
+    .hero-meta-strip {
+      display: inline-flex;
+      flex-wrap: wrap;
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.025);
+      margin-top: 10px;
+      overflow: hidden;
+    }
+    .hero-meta-cell {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 7px 14px;
+      border-right: 1px solid var(--border-color);
+    }
+    .hero-meta-cell:last-child {
+      border-right: none;
+    }
+    .hero-meta-k {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .hero-meta-v {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+      white-space: nowrap;
+    }
+    .hero-side-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 280px;
+      padding-left: 20px;
+      border-left: 1px solid var(--border-color);
+    }
+    .hero-score-pills {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .hero-action-btns {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    /* Search box in toolbar */
+    .toolbar-search {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 38px;
+      padding: 0 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+      background: rgba(255, 255, 255, 0.03);
+      min-width: 220px;
+      flex: 1 1 220px;
+      max-width: 280px;
+      color: var(--text-muted);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .toolbar-search:focus-within {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(124, 131, 255, 0.16);
+    }
+    .toolbar-search input {
+      flex: 1;
+      min-width: 0;
+      border: none;
+      outline: none;
+      background: transparent;
+      color: var(--text-primary);
+      font-size: 13px;
+      font-family: inherit;
+    }
+    .toolbar-search input::placeholder {
+      color: var(--text-muted);
+    }
+    .toolbar-search kbd {
+      font-family: 'JetBrains Mono', Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--text-muted);
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 0 5px;
+      line-height: 16px;
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .toolbar select, .country-filter-button {
+      height: 38px;
+      font-size: 13px;
+    }
+
+    /* Signal bars & Sublabels in Table */
+    .sig-bars {
+      display: inline-flex;
+      align-items: flex-end;
+      gap: 2px;
+      height: 11px;
+      margin-right: 5px;
+      vertical-align: middle;
+    }
+    .sig-bars i {
+      width: 3px;
+      border-radius: 1px;
+      background: rgba(255, 255, 255, 0.16);
+      display: inline-block;
+    }
+    html[data-theme="light"] .sig-bars i {
+      background: rgba(15, 23, 42, 0.16);
+    }
+    .sig-bars i:nth-child(1) { height: 4px; }
+    .sig-bars i:nth-child(2) { height: 7px; }
+    .sig-bars i:nth-child(3) { height: 11px; }
+    .latency-good .sig-bars i.on { background: #34d399; }
+    .latency-medium .sig-bars i.on { background: #fbbf24; }
+    .latency-poor .sig-bars i.on { background: #fb7185; }
+
+    .cell-sub {
+      font-size: 11.5px;
+      color: var(--text-muted);
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Type Tag & Grade Pills */
+    .type-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11.5px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      padding: 1px 7px;
+      border-radius: 5px;
+      border: 1px solid var(--border-color);
+      background: rgba(255, 255, 255, 0.03);
+      width: fit-content;
+    }
+    .type-tag::before {
+      content: "";
+      width: 5px;
+      height: 5px;
+      border-radius: 1px;
+      background: var(--tag-dot, #22d3ee);
+    }
+    .type-tag.t-res { --tag-dot: #22d3ee; }
+    .type-tag.t-host { --tag-dot: #a78bfa; }
+    .type-tag.t-mob { --tag-dot: #60a5fa; }
+
+    .qpills-row {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+      margin-top: 5px;
+    }
+    .cleanip-badge {
+      height: 22px;
+      padding: 0 7px;
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', Consolas, monospace;
+      font-size: 11px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .cleanip-badge:hover {
+      transform: translateY(-1px);
+    }
+    .cleanip-grade-ap {
+      background: linear-gradient(135deg, rgba(52, 211, 153, 0.22), rgba(34, 211, 238, 0.22));
+      color: #2dd4bf;
+      border-color: rgba(45, 212, 191, 0.42);
+      box-shadow: 0 0 10px rgba(45, 212, 191, 0.15);
+    }
+
+    /* CleanIP Modal Summary Card & Segmented Switch */
+    .report-summary-card {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1px solid var(--border-color);
+      background: rgba(255, 255, 255, 0.025);
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .report-grade-box {
+      width: 52px;
+      height: 52px;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      font-family: 'JetBrains Mono', Consolas, monospace;
+      font-size: 20px;
+      font-weight: 700;
+      flex-shrink: 0;
+      border: 1px solid rgba(45, 212, 191, 0.35);
+      background: rgba(45, 212, 191, 0.12);
+      color: #2dd4bf;
+    }
+    .report-seg {
+      display: inline-flex;
+      padding: 2px;
+      gap: 2px;
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+      background: rgba(255, 255, 255, 0.03);
+      height: 32px;
+    }
+    .report-seg button {
+      height: 26px;
+      padding: 0 10px;
+      border-radius: 6px;
+      border: none;
+      background: transparent;
+      font-size: 12px;
+      color: var(--text-secondary);
+      transform: none !important;
+      box-shadow: none !important;
+    }
+    .report-seg button.on {
+      background: var(--surface-solid);
+      color: var(--text-primary);
+      border: 1px solid var(--border-color);
+    }
+    .term-topbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 14px;
+      background: rgba(255, 255, 255, 0.035);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-bottom: none;
+      border-radius: 10px 10px 0 0;
+      font-family: 'JetBrains Mono', Consolas, monospace;
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+    .term-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    /* Selected Pill in Batch Bar */
+    .sel-pill-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      height: 28px;
+      padding: 0 11px 0 5px;
+      border-radius: 999px;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      background: rgba(255, 255, 255, 0.035);
+      border: 1px solid var(--border-color);
+      margin-right: 4px;
+    }
+    .sel-num-circle {
+      min-width: 20px;
+      height: 20px;
+      padding: 0 5px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 999px;
+      font-family: 'JetBrains Mono', Consolas, monospace;
+      font-weight: 700;
+      font-size: 11px;
+      background: var(--primary);
+      color: #ffffff;
+    }
+
+    /* Toast Notification */
+    .toasts-container {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 20000;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: flex-end;
+      pointer-events: none;
+    }
+    .ui-toast {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      max-width: 380px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      background: var(--surface-solid);
+      border: 1px solid var(--border-color-hover);
+      color: var(--text-primary);
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+    .ui-toast.in {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @media (max-width: 960px) {
+      .kpi-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .hero-side-panel {
+        padding-left: 0;
+        border-left: none;
+        padding-top: 14px;
+        border-top: 1px solid var(--border-color);
+        width: 100%;
+      }
+    }
+
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
         animation-duration: 0.01ms !important;
@@ -4721,10 +5308,13 @@ INDEX_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
+<div class="bg-fx" aria-hidden="true"></div>
 <header>
   <div class="brand">
     <h1>
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
+      <span class="brand-logo-box" aria-hidden="true">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h4l2.5-6 4 13 3-9 1.5 2H22"/></svg>
+      </span>
       AimiliVPN 节点管理系统
     </h1>
     <div id="status" class="status" role="status" aria-live="polite"><span class="status-dot"></span>服务加载中...</div>
@@ -4755,7 +5345,10 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
       Telegram
     </a>
-    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
+    <button id="theme_toggle_btn" class="theme-toggle-btn" type="button" onclick="toggleTheme()" title="切换深色 / 浅色外观" aria-label="切换主题">
+      <svg id="theme_icon_svg" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+    </button>
+    <button id="refresh" class="btn-primary">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       更新节点
     </button>
@@ -4793,13 +5386,56 @@ INDEX_HTML = r"""<!doctype html>
 <main>
   
     <!-- 当前连接活动节点卡片 -->
-    <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
+    <section class="active-node-section" id="active_node_card" style="margin-bottom: 18px;">
       <!-- Rendered dynamically by render() -->
     </section>
 
-
+    <!-- 实时 KPI 概览卡片 -->
+    <section class="kpi-grid" aria-label="节点池统计概览">
+      <div class="kpi-card">
+        <div class="kpi-label">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
+          候选节点总数
+        </div>
+        <div class="kpi-val"><span id="kpi_total_nodes">0</span><span class="kpi-unit">个节点</span></div>
+        <div class="kpi-sub" id="kpi_fav_sub">★ 已收藏 0 个常备节点</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>
+          可用节点占比
+        </div>
+        <div class="kpi-val"><span id="kpi_avail_nodes" style="color: var(--success);">0</span><span class="kpi-unit" id="kpi_avail_ratio">/ 0</span></div>
+        <div class="kpi-bar"><i id="kpi_avail_bar" style="width: 0%;"></i></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg>
+          平均实测延迟
+        </div>
+        <div class="kpi-val"><span id="kpi_avg_latency">-</span><span class="kpi-unit">ms</span></div>
+        <div class="kpi-sub" id="kpi_best_latency_sub">最快节点：-</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 4 6v6c0 4.5 3.4 8.3 8 9 4.6-.7 8-4.5 8-9V6l-8-3z"/><path d="m9 12 2 2 4-4"/></svg>
+          纯净度与住宅分布
+        </div>
+        <div class="kpi-val"><span id="kpi_high_purity">0</span><span class="kpi-unit">个 A 级以上</span></div>
+        <div class="kpi-dist" id="kpi_purity_dist">
+          <i style="flex: 1; background: var(--g-ap);"></i>
+          <i style="flex: 1; background: var(--g-b);"></i>
+          <i style="flex: 1; background: var(--g-c);"></i>
+        </div>
+      </div>
+    </section>
 
   <section class="toolbar">
+    <label class="toolbar-search" title="按 IP、端口、地区、运营商或 ASN 搜索">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="search_filter" type="text" placeholder="搜索 IP、地区或运营商…" autocomplete="off" />
+      <kbd>/</kbd>
+    </label>
     <select id="status_filter">
       <option value="all">全部节点</option>
       <option value="available">可用节点</option>
@@ -4889,8 +5525,9 @@ INDEX_HTML = r"""<!doctype html>
 
   <section class="batch-bar" aria-label="批量选择与检测工具栏">
     <div class="batch-bar-left">
-      <span style="font-size: 13px; color: var(--text-secondary); margin-right: 4px;">
-        已勾选 <strong id="selected_nodes_count" style="color: var(--primary);">0</strong> 个节点
+      <span class="sel-pill-badge">
+        <span id="selected_nodes_count" class="sel-num-circle">0</span>
+        <span>个已选节点</span>
       </span>
       <button type="button" class="batch-mini-btn" onclick="selectCurrentPageNodes()">全选本页</button>
       <button type="button" class="batch-mini-btn" onclick="selectAllFilteredNodes()">全选当前筛选</button>
@@ -5245,12 +5882,32 @@ INDEX_HTML = r"""<!doctype html>
         </button>
       </div>
 
-      <div id="cleanip_summary_bar" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 10px; padding: 12px 16px; margin-bottom: 14px; font-size: 13px; color: var(--text-secondary); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
-        <span id="cleanip_summary_text">正在查询 CleanIP 数据...</span>
-        <a id="cleanip_external_link" href="https://cleanip.io" target="_blank" rel="noopener noreferrer" style="color: #38bdf8; text-decoration: none; font-weight: 600;">在 CleanIP.io 查看完整网页报告 ↗</a>
+      <div id="cleanip_summary_bar" class="report-summary-card">
+        <div id="cleanip_modal_grade_box" class="report-grade-box">A+</div>
+        <div style="flex: 1; min-width: 200px;">
+          <div style="display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;">
+            <span id="cleanip_modal_score_num" class="mono" style="font-size: 24px; font-weight: 700; color: var(--text-primary);">-</span>
+            <span class="mono" style="font-size: 12px; color: var(--text-muted);">/ 100</span>
+            <span id="cleanip_modal_native_tag" class="badge available" style="padding: 1px 7px; font-size: 11px;">检测中</span>
+          </div>
+          <div id="cleanip_summary_text" style="font-size: 12.5px; color: var(--text-secondary); margin-top: 4px;">正在查询纯净度与风控数据...</div>
+        </div>
+        <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;">
+          <div class="report-seg">
+            <button id="seg_btn_cleanip" type="button" class="on" onclick="switchCleanIpModalSourceTo('cleanip')">🛡️ CleanIP</button>
+            <button id="seg_btn_intel" type="button" onclick="switchCleanIpModalSourceTo('intel')">🔍 三源对比</button>
+          </div>
+          <a id="cleanip_external_link" href="https://cleanip.io" target="_blank" rel="noopener noreferrer" style="color: #38bdf8; text-decoration: none; font-size: 12px; font-weight: 600;">在 CleanIP.io 查看网页报告 ↗</a>
+        </div>
       </div>
 
-      <div id="cleanip_terminal_container" style="background: #050811; border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 10px; height: 360px; padding: 16px; overflow-y: auto; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12.5px; line-height: 1.55; text-align: left; white-space: pre-wrap; word-break: break-all; color: #e2e8f0; box-shadow: inset 0 4px 20px rgba(0,0,0,0.8); margin-bottom: 18px;">正在加载报告...</div>
+      <div class="term-topbar">
+        <span class="term-dot" style="background: #ff5f57;"></span>
+        <span class="term-dot" style="background: #febc2e;"></span>
+        <span class="term-dot" style="background: #28c840;"></span>
+        <span id="cleanip_term_caption" style="margin-left: 6px;">purity-audit-report · console</span>
+      </div>
+      <div id="cleanip_terminal_container" style="background: #050811; border: 1px solid rgba(255, 255, 255, 0.07); border-radius: 0 0 10px 10px; height: 350px; padding: 16px; overflow-y: auto; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12.5px; line-height: 1.55; text-align: left; white-space: pre-wrap; word-break: break-all; color: #e2e8f0; box-shadow: inset 0 4px 20px rgba(0,0,0,0.8); margin-bottom: 18px;">正在加载报告...</div>
 
       <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
         <div style="display: flex; gap: 8px; flex-wrap: wrap;">
@@ -5262,6 +5919,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+<div id="ui_toasts" class="toasts-container" aria-live="polite"></div>
 </main>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
@@ -5282,6 +5940,61 @@ let lastNodesSnapshotSignature = "";
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
+
+function showToast(msg, borderColor = "var(--primary)", durationMs = 2400) {
+  const box = $("ui_toasts");
+  if (!box) return;
+  const el = document.createElement("div");
+  el.className = "ui-toast";
+  el.style.borderColor = borderColor;
+  el.innerHTML = `<span style="width:8px;height:8px;border-radius:50%;background:${borderColor};box-shadow:0 0 8px ${borderColor};flex-shrink:0;"></span><span>${msg}</span>`;
+  box.appendChild(el);
+  requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add("in")));
+  setTimeout(() => {
+    el.classList.remove("in");
+    setTimeout(() => el.remove(), 220);
+  }, durationMs);
+}
+
+function copyTextWithToast(text, label = "已复制到剪贴板") {
+  if (!text) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => showToast(esc(label), "var(--success)")).catch(() => {});
+  } else {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    showToast(esc(label), "var(--success)");
+  }
+}
+
+function applyTheme(theme) {
+  const next = theme === "light" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("aimili_ui_theme", next); } catch (e) {}
+  const svg = $("theme_icon_svg");
+  if (svg) {
+    svg.innerHTML = next === "dark"
+      ? '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'
+      : '<path d="M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5z"/>';
+  }
+}
+
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute("data-theme") || "dark";
+  const next = cur === "dark" ? "light" : "dark";
+  applyTheme(next);
+  showToast(next === "light" ? "已切换至浅色主题" : "已切换至深色主题");
+}
+
+try {
+  const savedTheme = localStorage.getItem("aimili_ui_theme");
+  if (savedTheme === "light" || savedTheme === "dark") applyTheme(savedTheme);
+} catch (e) {}
+
 function fetchWithTimeout(resource, options = {}, timeoutMs = 20000) {
   if (typeof AbortController === "undefined") return fetch(resource, options);
   const controller = new AbortController();
@@ -5498,7 +6211,10 @@ function countryFlag(countryShort) {
 function nodeLatencyHtml(node) {
   const measured = Number(node && node.latency_ms) || 0;
   if (measured > 0) {
-    return `<span class="latency-val ${getLatencyClass(measured)}" title="本机实测延迟">${measured} ms</span>`;
+    const cls = getLatencyClass(measured);
+    const bars = measured < 80 ? 3 : (measured < 180 ? 2 : 1);
+    const sigHtml = `<span class="sig-bars" aria-hidden="true"><i class="${bars >= 1 ? 'on' : ''}"></i><i class="${bars >= 2 ? 'on' : ''}"></i><i class="${bars >= 3 ? 'on' : ''}"></i></span>`;
+    return `<span class="latency-val ${cls}" title="本机实测延迟">${sigHtml}${measured} ms</span>`;
   }
   const estimated = Number(node && node.ping) || 0;
   if (estimated > 0) {
@@ -5510,6 +6226,7 @@ function nodeLatencyHtml(node) {
 function getCleanIpGradeClass(grade, score) {
   const g = String(grade || "").toUpperCase();
   const s = Number(score);
+  if (g === "A+" || s >= 95) return "cleanip-grade-ap";
   if (g.startsWith("A") || s >= 85) return "cleanip-grade-a";
   if (g.startsWith("B") || s >= 70) return "cleanip-grade-b";
   if (g.startsWith("C") || s >= 50) return "cleanip-grade-c";
@@ -5843,9 +6560,18 @@ function getFilteredNodes() {
   const selectedStatus = $("status_filter") ? $("status_filter").value : "all";
   const selectedRegion = $("region_filter") ? $("region_filter").value : "";
   const sortMode = $("sort_filter") ? $("sort_filter").value : "default";
+  const searchQuery = $("search_filter") ? String($("search_filter").value || "").trim().toLowerCase() : "";
   const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
   const filtered = nodes.filter(n => {
     if (!n) return false;
+    if (searchQuery) {
+      const hay = [
+        n.ip, n.remote_host, n.remote_port, n.id, n.location, n.region, n.city,
+        n.country, translateCountry(n.country), getNodeRegion(n),
+        n.owner, n.as_name, n.asn
+      ].filter(Boolean).join(" ").toLowerCase();
+      if (!hay.includes(searchQuery)) return false;
+    }
     const isFavNode = favoriteIds.includes(n.id);
     if (showFavoritesOnly && !isFavNode) {
       return false;
@@ -5963,43 +6689,64 @@ function render(){
   } else if (activeNode) {
     const latencyText = nodeLatencyHtml(activeNode);
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
+    const activeReg = getNodeRegion(activeNode);
     const declaredFlag = countryFlag(activeNode.country_short);
     const locationFlag = countryFlag(activeNode.geo_country_short || activeNode.country_short);
     const ipTypeTitle = `${translateIpType(activeNode.ip_type)} · 置信度：${translateConfidence(activeNode.ip_type_confidence)} · 来源：${(activeNode.ip_type_sources || []).join(" + ") || "未知"}`;
+    const activeAddr = `${activeNode.ip || activeNode.remote_host || ""}:${activeNode.remote_port || ""}`;
     activeCardHtml = `
       <div class="active-card">
-        <div class="active-card-info">
-          <div class="stat-icon-wrapper" style="background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.3); width: 48px; height: 48px; border-radius: 12px;">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #34d399; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+        <div class="active-card-info" style="flex: 1; min-width: 280px;">
+          <div class="stat-icon-wrapper" style="background: rgba(52, 211, 153, 0.14); border-color: rgba(52, 211, 153, 0.32); width: 48px; height: 48px; border-radius: 12px; flex-shrink: 0;">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.4" style="color: #34d399; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
           </div>
-          <div class="active-card-details">
-            <div class="active-card-title">
-              <span class="badge available"><span class="badge-pulse"></span>已连接</span>
-              <strong>${declaredFlag ? `${esc(declaredFlag)} ` : ""}${esc(translateCountry(activeNode.country))} 节点</strong>
+          <div class="active-card-details" style="flex: 1; min-width: 240px;">
+            <div class="active-card-title" style="text-transform: none; letter-spacing: 0;">
+              <span class="badge available"><span class="badge-pulse"></span>当前主用</span>
+              <strong style="font-size: 16px; color: var(--text-primary);">${declaredFlag ? `${esc(declaredFlag)} ` : ""}${esc(translateCountry(activeNode.country))}${activeReg ? " · " + esc(activeReg) : ""}</strong>
             </div>
-            <div class="active-card-value mono" style="font-size: 20px; margin-top: 2px;">
-              ${esc(activeNode.ip || activeNode.remote_host)}:${activeNode.remote_port || ""}
+            <div style="display: flex; align-items: center; gap: 8px; margin-top: 2px;">
+              <span class="active-card-value mono" style="font-size: 21px;">${esc(activeAddr)}</span>
+              <button type="button" class="batch-mini-btn" style="height: 24px; padding: 0 8px; font-size: 11px;" onclick="copyTextWithToast('${esc(activeAddr)}', '已复制当前节点地址: ${esc(activeAddr)}')" title="复制节点 IP:端口">复制</button>
             </div>
-            <div class="active-card-meta" style="margin-top: 4px;">
-              <span title="IP 情报源推测位置；节点申报国家见标题">物理位置: <strong>${locationFlag ? `${esc(locationFlag)} ` : ""}${esc(displayLocation)}</strong></span>
-              <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
-              <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
-              <span style="margin-left: 12px;" title="${esc(ipTypeTitle)}">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
+            <div class="hero-meta-strip">
+              <div class="hero-meta-cell">
+                <span class="hero-meta-k">物理位置</span>
+                <span class="hero-meta-v" title="IP 情报源推测位置；节点申报国家见标题">${locationFlag ? `${esc(locationFlag)} ` : ""}${esc(displayLocation)}</span>
+              </div>
+              <div class="hero-meta-cell">
+                <span class="hero-meta-k">实测延时</span>
+                <span class="hero-meta-v">${latencyText}</span>
+              </div>
+              <div class="hero-meta-cell">
+                <span class="hero-meta-k">运营主体 / ISP</span>
+                <span class="hero-meta-v">${esc(activeNode.owner || activeNode.as_name || "-")}</span>
+              </div>
+              <div class="hero-meta-cell" title="${esc(ipTypeTitle)}">
+                <span class="hero-meta-k">IP 类型</span>
+                <span class="hero-meta-v"><span class="type-tag ${activeNode.ip_type === 'hosting' ? 't-host' : 't-res'}">${esc(translateIpType(activeNode.ip_type))}</span></span>
+              </div>
             </div>
           </div>
         </div>
-        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-          ${renderNodeCleanIpBadge(activeNode)}
-          <button type="button" class="cleanip-btn" style="height: 38px; padding: 0 12px; border-radius: 8px;" onclick="checkActiveExitCleanIp(event, 'cleanip')" title="直接由 VPS 本机查询该出口 IP 的 CleanIP 报告（不经过家宽隧道）">
-            🛡️ CleanIP检测
-          </button>
-          <button type="button" class="intel-btn" style="height: 38px; padding: 0 12px; border-radius: 8px;" onclick="checkActiveExitCleanIp(event, 'intel')" title="查询三源风控情报库 (iplocate.io + ip-api.com + ipapi.is) 对比报告">
-            🔍 三源对比
-          </button>
-          <button class="btn-danger" ${disconnectInFlight ? "disabled" : ""} style="height: 38px; padding: 0 16px; border-radius: 8px;" onclick="disconnectNode()">
-            <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-            断开连接
-          </button>
+        <div class="hero-side-panel">
+          <div style="font-size: 11.5px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center;">
+            <span>出口纯净度评级 · 点击胶囊查看报告</span>
+          </div>
+          <div class="hero-score-pills">
+            ${renderNodeCleanIpBadge(activeNode) || '<span style="font-size:12px; color:var(--text-muted);">尚未检测当前节点纯净度</span>'}
+          </div>
+          <div class="hero-action-btns">
+            <button type="button" class="cleanip-btn" style="height: 34px; padding: 0 12px; border-radius: 8px;" onclick="checkActiveExitCleanIp(event, 'cleanip')" title="直接由 VPS 本机查询该出口 IP 的 CleanIP 报告（不经过家宽隧道）">
+              🛡️ CleanIP检测
+            </button>
+            <button type="button" class="intel-btn" style="height: 34px; padding: 0 12px; border-radius: 8px;" onclick="checkActiveExitCleanIp(event, 'intel')" title="查询多源风控情报库对比报告">
+              🔍 三源对比
+            </button>
+            <button class="btn-danger" ${disconnectInFlight ? "disabled" : ""} style="height: 34px; padding: 0 14px; border-radius: 8px;" onclick="disconnectNode()">
+              断开连接
+            </button>
+          </div>
         </div>
       </div>
     `;
@@ -6087,6 +6834,7 @@ function render(){
   }
 
   updateFavPanelUI();
+  updateKpiOverview();
 
   // Pagination calculation
   const totalPages = Math.ceil(shown.length / pageSize) || 1;
@@ -6149,21 +6897,30 @@ function render(){
       const intelBtn = `<button class="intel-btn" ${isIntelChecking ? "disabled" : ""} onclick="openNodeCleanIpModal('${esc(n.id)}', event, 'intel')" title="独立查询 iplocate.io + ip-api.com + ipapi.is 三大情报库并与 CleanIP 对比">${intelBtnText}</button>`;
       const cachedFavHint = (isFav && n.in_latest_feed === false) ? `<span style="font-size:10px; color:var(--warning); margin-left:4px;" title="该收藏节点暂未出现在最新公共广播中，已由本地收藏快照永久保活">★保活</span>` : "";
 
+      const typeTagCls = n.ip_type === "hosting" ? "t-host" : (n.ip_type === "mobile" ? "t-mob" : "t-res");
+      const nRegLabel = getNodeRegion(n);
+      const protoLabel = String(n.proto || "udp").toUpperCase();
       return `<tr ${rowClass}>
-        <td style="text-align: center; padding: 14px 8px;">
+        <td style="text-align: center; padding: 12px 8px;">
           <label class="node-check-label">
             <input class="node-check-input" type="checkbox" value="${esc(n.id)}" ${isChecked ? "checked" : ""} onchange="toggleSelectNode('${esc(n.id)}', this.checked, event)">
           </label>
         </td>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td class="mono" style="white-space: nowrap; max-width: 210px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}${cachedFavHint}</td>
+        <td style="white-space: nowrap; max-width: 210px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">
+          <div class="mono" style="font-weight: 600;">${esc(n.ip||n.remote_host)}<span style="color: var(--text-muted);">:${n.remote_port||""}</span>${cachedFavHint}</div>
+          <div class="cell-sub mono">${esc(protoLabel)}${nRegLabel ? " · " + esc(nRegLabel) : ""}</div>
+        </td>
         <td style="white-space: nowrap;">${latencyText}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
-        <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
-        <td style="white-space: nowrap; max-width: 165px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">
+        <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">
+          <div style="font-weight: 500; overflow: hidden; text-overflow: ellipsis;">${esc(n.owner||n.as_name||"-")}</div>
+          <div class="cell-sub">${(n.cleanip_is_native || n.intel_is_native) ? "原生住宅/注册段" : (n.ip_type === "hosting" ? "数据中心/托管段" : "ISP 宽带接入")}</div>
+        </td>
+        <td style="white-space: nowrap; max-width: 175px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">
           <div style="display:flex; flex-direction:column; align-items:flex-start;">
-            <span>${esc(translateIpType(n.ip_type))}</span>
-            ${cleanIpBadgeHtml}
+            <span class="type-tag ${typeTagCls}">${esc(translateIpType(n.ip_type))}</span>
+            <div class="qpills-row">${cleanIpBadgeHtml}</div>
           </div>
         </td>
         <td>
@@ -6522,25 +7279,78 @@ function closeCleanIpModal() {
 function updateCleanIpModalHeader(source) {
   const titleEl = $("cleanip_modal_title");
   const switchBtn = $("btn_switch_source_modal");
+  const segClean = $("seg_btn_cleanip");
+  const segIntel = $("seg_btn_intel");
+  const captionEl = $("cleanip_term_caption");
+  const isIntel = source === "intel";
   if (titleEl) {
-    titleEl.textContent = source === "intel"
-      ? "🔍 三源风控情报库对比报告 (iplocate.io + ip-api.com + ipapi.is)"
+    titleEl.textContent = isIntel
+      ? "🔍 多源风控情报联合评估报告 (ProxyCheck · Scamalytics · iplocate · ip-api)"
       : "🛡️ CleanIP.io 纯净度与风控检测报告 (VPS本机直连)";
   }
   if (switchBtn) {
-    switchBtn.textContent = source === "intel"
+    switchBtn.textContent = isIntel
       ? "🛡️ 切换 CleanIP 官方报告"
       : "🔍 切换三源对比报告";
   }
+  if (segClean) segClean.classList.toggle("on", !isIntel);
+  if (segIntel) segIntel.classList.toggle("on", isIntel);
+  if (captionEl) {
+    captionEl.textContent = isIntel ? "audit-report · multi-source-v3" : "audit-report · cleanip-official";
+  }
+}
+
+async function switchCleanIpModalSourceTo(targetSource) {
+  if ((currentCleanIpContext.source || "cleanip") === targetSource) return;
+  await switchCleanIpModalSource();
 }
 
 function renderCleanIpModalContent(info, source = "cleanip") {
   const summaryEl = $("cleanip_summary_text");
   const linkEl = $("cleanip_external_link");
   const termEl = $("cleanip_terminal_container");
+  const gradeBox = $("cleanip_modal_grade_box");
+  const scoreNum = $("cleanip_modal_score_num");
+  const nativeTag = $("cleanip_modal_native_tag");
   updateCleanIpModalHeader(source);
   if (!info) return;
   const isIntel = source === "intel";
+  const scoreVal = isIntel ? (info.intel_score ?? info.cleanip_score) : (info.cleanip_score ?? info.intel_score);
+  const gradeVal = String(isIntel ? (info.intel_grade || info.cleanip_grade || "B") : (info.cleanip_grade || info.intel_grade || "B"));
+  const isNative = isIntel ? Boolean(info.intel_is_native) : Boolean(info.cleanip_is_native);
+  const nativeLabel = isIntel ? (info.intel_native_label || (isNative ? "原生 IP" : "广播 IP")) : (info.cleanip_native_label || (isNative ? "原生 IP" : "广播 IP"));
+
+  if (scoreNum) scoreNum.textContent = (scoreVal !== undefined && scoreVal !== null && scoreVal !== "") ? String(scoreVal) : "-";
+  if (gradeBox) {
+    gradeBox.textContent = gradeVal || "-";
+    const sNum = Number(scoreVal) || 0;
+    if (gradeVal === "A+" || sNum >= 95) {
+      gradeBox.style.color = "#2dd4bf";
+      gradeBox.style.borderColor = "rgba(45, 212, 191, 0.45)";
+      gradeBox.style.background = "rgba(45, 212, 191, 0.14)";
+    } else if (gradeVal.startsWith("A") || sNum >= 85) {
+      gradeBox.style.color = "#4ade80";
+      gradeBox.style.borderColor = "rgba(74, 222, 128, 0.4)";
+      gradeBox.style.background = "rgba(74, 222, 128, 0.12)";
+    } else if (gradeVal.startsWith("B") || sNum >= 70) {
+      gradeBox.style.color = "#60a5fa";
+      gradeBox.style.borderColor = "rgba(96, 165, 250, 0.4)";
+      gradeBox.style.background = "rgba(96, 165, 250, 0.12)";
+    } else if (gradeVal.startsWith("C") || sNum >= 50) {
+      gradeBox.style.color = "#fbbf24";
+      gradeBox.style.borderColor = "rgba(251, 191, 36, 0.4)";
+      gradeBox.style.background = "rgba(251, 191, 36, 0.12)";
+    } else {
+      gradeBox.style.color = "#f87171";
+      gradeBox.style.borderColor = "rgba(248, 113, 113, 0.4)";
+      gradeBox.style.background = "rgba(248, 113, 113, 0.12)";
+    }
+  }
+  if (nativeTag) {
+    nativeTag.textContent = nativeLabel;
+    nativeTag.className = "badge " + (String(nativeLabel).includes("广播") ? "not_checked" : "available");
+  }
+
   const summaryVal = isIntel
     ? (info.intel_summary || info.cleanip_summary || `IP: ${info.ip || "-"} · 三源评分: ${info.intel_score ?? info.cleanip_score ?? "-"}/100`)
     : (info.cleanip_summary || `IP: ${info.ip || "-"} · 纯净度: ${info.cleanip_score ?? "-"}/100 (${info.cleanip_grade || "-"})`);
@@ -6896,6 +7706,15 @@ $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
 if ($("region_filter")) $("region_filter").onchange=()=>{ currentPage = 1; render(); };
 if ($("sort_filter")) $("sort_filter").onchange=()=>{ currentPage = 1; render(); };
+if ($("search_filter")) {
+  $("search_filter").oninput = () => { currentPage = 1; render(); };
+}
+document.addEventListener("keydown", e => {
+  if (e.key === "/" && $("search_filter") && !["INPUT", "TEXTAREA", "SELECT"].includes((document.activeElement && document.activeElement.tagName) || "")) {
+    e.preventDefault();
+    $("search_filter").focus();
+  }
+});
 
 $("refresh").onclick=async()=>{
   refreshButtonBusy("正在启动更新...");
@@ -7057,6 +7876,58 @@ function toggleFavoritesView() {
   showFavoritesOnly = !showFavoritesOnly;
   currentPage = 1;
   render();
+}
+
+function updateKpiOverview() {
+  const total = Array.isArray(nodes) ? nodes.length : 0;
+  const favIds = Array.isArray(state && state.favorite_node_ids) ? state.favorite_node_ids : [];
+  const availNodes = (nodes || []).filter(n => n && (n.probe_status === "available" || n.active));
+  const availCount = availNodes.length;
+  const ratioPct = total > 0 ? Math.round((availCount / total) * 100) : 0;
+
+  if ($("kpi_total_nodes")) $("kpi_total_nodes").textContent = String(total);
+  if ($("kpi_fav_sub")) {
+    const favModeTxt = (state && state.routing_mode === "favorites")
+      ? ` · 仅收藏轮换中${state.fav_region ? "(" + state.fav_region + ")" : ""}`
+      : "";
+    $("kpi_fav_sub").textContent = `★ 已收藏 ${favIds.length} 个常备节点${favModeTxt}`;
+  }
+  if ($("kpi_avail_nodes")) $("kpi_avail_nodes").textContent = String(availCount);
+  if ($("kpi_avail_ratio")) $("kpi_avail_ratio").textContent = `/ ${total} (${ratioPct}%)`;
+  if ($("kpi_avail_bar")) $("kpi_avail_bar").style.width = `${ratioPct}%`;
+
+  const measuredLats = (nodes || [])
+    .map(n => Number(n && n.latency_ms) || 0)
+    .filter(v => v > 0);
+  if (measuredLats.length > 0) {
+    const avgLat = Math.round(measuredLats.reduce((a, b) => a + b, 0) / measuredLats.length);
+    const minLat = Math.min(...measuredLats);
+    if ($("kpi_avg_latency")) $("kpi_avg_latency").textContent = String(avgLat);
+    if ($("kpi_best_latency_sub")) $("kpi_best_latency_sub").textContent = `最快实测：${minLat} ms (共测 ${measuredLats.length} 个)`;
+  } else {
+    if ($("kpi_avg_latency")) $("kpi_avg_latency").textContent = "-";
+    if ($("kpi_best_latency_sub")) $("kpi_best_latency_sub").textContent = "等待实测延迟数据";
+  }
+
+  let gradeA = 0, gradeB = 0, gradeCD = 0;
+  (nodes || []).forEach(n => {
+    const p = getNodeEffectivePurity(n);
+    if (p === null) return;
+    if (p >= 85) gradeA++;
+    else if (p >= 70) gradeB++;
+    else gradeCD++;
+  });
+  if ($("kpi_high_purity")) $("kpi_high_purity").textContent = String(gradeA);
+  if ($("kpi_purity_dist")) {
+    const sum = gradeA + gradeB + gradeCD;
+    if (sum > 0) {
+      $("kpi_purity_dist").innerHTML = `
+        <i style="flex: ${Math.max(1, gradeA)}; background: var(--g-ap);" title="A+/A级: ${gradeA}"></i>
+        <i style="flex: ${Math.max(1, gradeB)}; background: var(--g-b);" title="B级: ${gradeB}"></i>
+        <i style="flex: ${Math.max(1, gradeCD)}; background: var(--g-c);" title="C/D级: ${gradeCD}"></i>
+      `;
+    }
+  }
 }
 
 function updateFavPanelUI() {
