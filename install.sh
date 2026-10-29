@@ -63,6 +63,7 @@ if [ "$PKG_MGR" = "apt-get" ]; then
     apt-get update -q || true
     echo -e "  -> 正在运行 apt-get install 安装基础依赖包..."
     apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
+    apt-get install -y sstp-client ppp isc-dhcp-client || true
 elif [ "$PKG_MGR" = "apk" ]; then
     echo -e "  -> 正在运行 apk update 更新软件源清单..."
     apk update || true

@@ -182,11 +182,13 @@ cleanip_batch_running = False
 cleanip_batch_total = 0
 cleanip_batch_completed = 0
 active_sessions: dict[str, float] = {}
-active_openvpn_process: subprocess.Popen[str] | None = None
-pending_openvpn_process: subprocess.Popen[str] | None = None
+active_openvpn_process: Any = None
+pending_openvpn_process: Any = None
 active_connection_cancel_event: threading.Event | None = None
 connection_epoch = 0
 active_openvpn_node_id = ""
+active_tunnel_interface = "tun0"
+active_tunnel_protocol = "openvpn"
 is_connecting = False
 last_active_ping_time = 0.0
 last_active_latency = 0
@@ -1819,7 +1821,316 @@ def run_openvpn_until_ready(
     return ok, message, process
 
 
-def setup_policy_routing(interface: str = "tun0") -> bool:
+class SoftEtherVirtualProcess:
+    """Process-like handle representing an active SoftEther SSL-VPN session on vpn_se."""
+    def __init__(self, account_name: str, vpncmd_bin: str, dev: str = "vpn_se") -> None:
+        self.account_name = account_name
+        self.vpncmd_bin = vpncmd_bin
+        self.dev = dev
+        self._terminated = False
+
+    def poll(self) -> int | None:
+        if self._terminated:
+            return 0
+        if sys.platform.startswith("linux") and not Path(f"/sys/class/net/{self.dev}").exists():
+            return 1
+        return None
+
+    def terminate(self) -> None:
+        if self._terminated:
+            return
+        self._terminated = True
+        try:
+            subprocess.run(
+                [self.vpncmd_bin, "localhost", "/CLIENT", "/CMD", "AccountDisconnect", self.account_name],
+                capture_output=True,
+                timeout=4,
+            )
+            subprocess.run(
+                [self.vpncmd_bin, "localhost", "/CLIENT", "/CMD", "AccountDelete", self.account_name],
+                capture_output=True,
+                timeout=4,
+            )
+        except Exception:
+            pass
+        try:
+            subprocess.run(["ip", "addr", "flush", "dev", self.dev], capture_output=True, timeout=2)
+        except Exception:
+            pass
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.terminate()
+        return 0
+
+    def kill(self) -> None:
+        self.terminate()
+
+
+def run_sstp_until_ready(
+    remote_host: str,
+    port: int,
+    keep_alive: bool,
+    timeout: int | None = None,
+    unit: int = 0,
+    cancel_event: threading.Event | None = None,
+    track_pending: bool = False,
+) -> tuple[bool, str, Any, str]:
+    """
+    Connect or probe a VPNGate node via MS-SSTP protocol using sstpc + pppd.
+    Creates ppp{unit} interface.
+    """
+    global pending_openvpn_process
+    sstpc_bin = vpn_utils.find_sstpc_binary()
+    dev = f"ppp{unit}"
+    if not sstpc_bin:
+        return False, "未安装 sstp-client (sstpc)，跳过 SSTP 协议", None, dev
+    limit = timeout if timeout is not None else OPENVPN_PROBE_TIMEOUT_SECONDS
+    cmd = [
+        sstpc_bin,
+        "--cert-warn",
+        "--tls-ext",
+        "--log-stdout",
+        "--log-level",
+        "4",
+        "--user",
+        OPENVPN_AUTH_USER,
+        "--password",
+        OPENVPN_AUTH_PASS,
+        f"{remote_host}:{int(port)}",
+        "--",
+        "noauth",
+        "nodefaultroute",
+        "usepeerdns",
+        "refuse-eap",
+        "noipdefault",
+        "nodetach",
+        "unit",
+        str(unit),
+    ]
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(ROOT_DIR),
+        )
+    except Exception as exc:
+        return False, f"SSTP 启动失败: {exc}", None, dev
+
+    if track_pending:
+        with lock:
+            if cancel_event is not None and cancel_event.is_set():
+                stop_process(process)
+                return False, "连接操作已取消", None, dev
+            pending_openvpn_process = process
+
+    lines: queue.Queue[str | None] = queue.Queue()
+    startup_done = [False]
+
+    def reader() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            line_str = line.rstrip()
+            if not startup_done[0]:
+                lines.put(line_str)
+            elif keep_alive:
+                log_to_json("INFO", "VPN", f"[SSTP] {line_str}")
+        if not startup_done[0]:
+            lines.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    started = time.time()
+    ok = False
+    cancelled = False
+    message = "SSTP 握手未完成"
+    while time.time() - started < limit:
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            message = "连接操作已取消"
+            break
+        try:
+            line = lines.get(timeout=0.5)
+        except queue.Empty:
+            if process.poll() is not None:
+                break
+            if sys.platform.startswith("linux") and Path(f"/sys/class/net/{dev}").exists():
+                res_ip = subprocess.run(["ip", "-4", "addr", "show", "dev", dev], capture_output=True, text=True, timeout=2)
+                if "inet " in res_ip.stdout:
+                    ok = True
+                    message = f"MS-SSTP connected in {int((time.time() - started) * 1000)} ms ({remote_host}:{port})."
+                    break
+            continue
+        if line is None:
+            break
+        lower = line.lower()
+        if "local  ip address" in lower or "remote ip address" in lower or "connection was established" in lower:
+            ok = True
+            message = f"MS-SSTP connected in {int((time.time() - started) * 1000)} ms ({remote_host}:{port})."
+            break
+        if "authentication failed" in lower or "verification failed" in lower or "status 40" in lower or "unrecoverable ssl" in lower:
+            message = f"SSTP 握手失败: {line[-120:]}"
+            break
+
+    startup_done[0] = True
+    if not keep_alive or not ok or cancelled:
+        stop_process(process)
+        process = None
+    if track_pending:
+        with lock:
+            if pending_openvpn_process is process:
+                pending_openvpn_process = None
+    return ok, message, process, dev
+
+
+def run_softether_sslvpn_until_ready(
+    remote_host: str,
+    port: int,
+    keep_alive: bool,
+    timeout: int | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[bool, str, Any, str, str]:
+    """
+    Connect or probe a VPNGate node via native SoftEther SSL-VPN protocol.
+    - When keep_alive=False (probing): verifies TLS + SoftEther HTTPS endpoint signature first,
+      or uses vpncmd if installed.
+    - When keep_alive=True (connecting): uses vpnclient + vpncmd on NIC 'se' (interface 'vpn_se')
+      and obtains an IP + peer gateway inside VPNNAT / VPNGATE hub without overwriting the VPS default route.
+    Returns (ok, message, virtual_process, dev, gateway_ip).
+    """
+    dev = "vpn_se"
+    if not keep_alive:
+        phys_dev = vpn_utils.get_physical_interface()
+        sig_ok, sig_msg = vpn_utils.probe_softether_sslvpn_signature(
+            remote_host,
+            port,
+            dev=phys_dev,
+            timeout=min(4.0, float(timeout or 6)),
+        )
+        return sig_ok, sig_msg, None, dev, ""
+
+    vpnclient_bin, vpncmd_bin = vpn_utils.find_softether_binaries()
+    if not vpnclient_bin or not vpncmd_bin:
+        return False, "系统未安装 SoftEther vpnclient/vpncmd，无法建立原生 SSL-VPN 网卡连接", None, dev, ""
+
+    limit = timeout if timeout is not None else 25
+    account_name = "aimili_active"
+    started = time.time()
+    try:
+        subprocess.run([vpnclient_bin, "start"], capture_output=True, timeout=5)
+        subprocess.run([vpncmd_bin, "localhost", "/CLIENT", "/CMD", "NicCreate", "se"], capture_output=True, timeout=5)
+        subprocess.run([vpncmd_bin, "localhost", "/CLIENT", "/CMD", "AccountDisconnect", account_name], capture_output=True, timeout=4)
+        subprocess.run([vpncmd_bin, "localhost", "/CLIENT", "/CMD", "AccountDelete", account_name], capture_output=True, timeout=4)
+        create_res = subprocess.run(
+            [
+                vpncmd_bin,
+                "localhost",
+                "/CLIENT",
+                "/CMD",
+                "AccountCreate",
+                account_name,
+                f"/SERVER:{remote_host}:{int(port)}",
+                "/HUB:VPNGATE",
+                f"/USERNAME:{OPENVPN_AUTH_USER}",
+                "/NICNAME:se",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=6,
+        )
+        if create_res.returncode != 0:
+            return False, f"SoftEther AccountCreate 失败: {create_res.stdout[-120:]}", None, dev, ""
+        subprocess.run(
+            [vpncmd_bin, "localhost", "/CLIENT", "/CMD", "AccountAnonymousSet", account_name],
+            capture_output=True,
+            timeout=5,
+        )
+        subprocess.run(
+            [vpncmd_bin, "localhost", "/CLIENT", "/CMD", "AccountConnect", account_name],
+            capture_output=True,
+            timeout=5,
+        )
+
+        connected = False
+        while time.time() - started < limit:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            st_res = subprocess.run(
+                [vpncmd_bin, "localhost", "/CLIENT", "/CMD", "AccountStatusGet", account_name],
+                capture_output=True,
+                text=True,
+                timeout=4,
+            )
+            out_lower = st_res.stdout.lower()
+            if "connection completed" in out_lower or "session established" in out_lower or "连接已完成" in out_lower:
+                connected = True
+                break
+            time.sleep(0.8)
+
+        if not connected:
+            subprocess.run([vpncmd_bin, "localhost", "/CLIENT", "/CMD", "AccountDisconnect", account_name], capture_output=True, timeout=4)
+            subprocess.run([vpncmd_bin, "localhost", "/CLIENT", "/CMD", "AccountDelete", account_name], capture_output=True, timeout=4)
+            return False, f"SoftEther SSL-VPN 握手超时 ({remote_host}:{port})", None, dev, ""
+
+        # Protect VPS physical route to VPN server before running DHCP on vpn_se
+        phys_dev = vpn_utils.get_physical_interface()
+        if phys_dev:
+            try:
+                res_rt = subprocess.run(["ip", "route", "show", "default", "dev", phys_dev], capture_output=True, text=True, timeout=2)
+                gw_match = re.search(r"via\s+(\S+)", res_rt.stdout)
+                if gw_match:
+                    phys_gw = gw_match.group(1)
+                    subprocess.run(["ip", "route", "replace", f"{remote_host}/32", "via", phys_gw, "dev", phys_dev], capture_output=True, timeout=2)
+            except Exception:
+                pass
+
+        subprocess.run(["ip", "link", "set", "dev", dev, "up"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "addr", "flush", "dev", dev], capture_output=True, timeout=2)
+        # Obtain IP without overwriting default route if possible, or assign / obtain via dhclient/udhcpc
+        for dhcp_cmd in (
+            ["dhclient", "-1", "-v", dev],
+            ["udhcpc", "-i", dev, "-n", "-q"],
+        ):
+            try:
+                subprocess.run(dhcp_cmd, capture_output=True, timeout=10)
+                break
+            except Exception:
+                continue
+
+        # Remove any default route injected into main table by dhclient on vpn_se so SSH stays on eth0
+        try:
+            subprocess.run(["ip", "route", "del", "default", "dev", dev], capture_output=True, timeout=2)
+        except Exception:
+            pass
+
+        addr_res = subprocess.run(["ip", "-4", "addr", "show", "dev", dev], capture_output=True, text=True, timeout=2)
+        ip_m = re.search(r"inet\s+(\d+\.\d+\.\d+\.)(\d+)/(\d+)", addr_res.stdout)
+        if not ip_m:
+            vproc = SoftEtherVirtualProcess(account_name, vpncmd_bin, dev=dev)
+            vproc.terminate()
+            return False, "SoftEther SSL-VPN 已连接，但未能通过 DHCP 获取内网 IP", None, dev, ""
+
+        subnet_prefix = ip_m.group(1)
+        # VPNGate SecureNAT gateway is standardly .1 on 10.211.254.1 or X.X.X.1
+        gw_ip = f"{subnet_prefix}1"
+        if subnet_prefix.startswith("10.211."):
+            gw_ip = "10.211.254.254"
+            # Check if .1 or .254 is in neighbor/route table
+            rt_dev = subprocess.run(["ip", "-4", "route", "show", "dev", dev], capture_output=True, text=True, timeout=2).stdout
+            m_src = re.search(r"(\d+\.\d+\.\d+\.\d+)/\d+", rt_dev)
+            if "10.211." in rt_dev:
+                gw_ip = "10.211.254.254"
+
+        vproc = SoftEtherVirtualProcess(account_name, vpncmd_bin, dev=dev)
+        return True, f"SoftEther SSL-VPN connected in {int((time.time() - started) * 1000)} ms ({remote_host}:{port}).", vproc, dev, gw_ip
+    except Exception as exc:
+        return False, f"SoftEther SSL-VPN 异常: {exc}", None, dev, ""
+
+
+def setup_policy_routing(interface: str = "tun0", gateway_ip: str = "") -> bool:
+    proxy_server.set_active_tunnel_interface(interface)
     try:
         subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
     except Exception:
@@ -1832,7 +2143,14 @@ def setup_policy_routing(interface: str = "tun0") -> bool:
     success = False
     for attempt in range(1, 4):
         try:
-            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
+            route_cmd = ["ip", "route", "add", "default"]
+            if gateway_ip:
+                route_cmd.extend(["via", gateway_ip])
+            route_cmd.extend(["dev", interface, "table", "100"])
+            try:
+                subprocess.run(route_cmd, check=True, timeout=2)
+            except Exception:
+                subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
             subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
             # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
             for proc_path in ["all", "default", interface]:
@@ -1861,9 +2179,12 @@ def cleanup_policy_routing() -> None:
         pass
 
 def stop_active_openvpn() -> None:
-    global active_openvpn_process, active_openvpn_node_id
+    global active_openvpn_process, active_openvpn_node_id, active_tunnel_interface, active_tunnel_protocol
     with lock:
         cleanup_policy_routing()
+        active_tunnel_interface = "tun0"
+        active_tunnel_protocol = "openvpn"
+        proxy_server.set_active_tunnel_interface("tun0")
         config_to_delete = None
         if active_openvpn_node_id:
             nodes = read_nodes()
@@ -2269,14 +2590,18 @@ def probe_openvpn_with_protocol_fallbacks(
     dev: str,
     primary_timeout: int | None = None,
     fallback_timeout: int | None = None,
-    max_fallbacks: int = 2,
+    max_fallbacks: int = 4,
     cancel_event: threading.Event | None = None,
     track_pending: bool = False,
+    host_name: str = "",
 ) -> tuple[bool, str, str, int, str]:
     """
-    Probe a node using its primary OpenVPN (proto, port) first, and if that fails with a
-    non-systemic / non-auth error, automatically try alternative SoftEther OpenVPN protocols
-    and ports (e.g., UDP <-> TCP on same port, TCP 443, TCP 995, UDP 1194, TCP 5555).
+    Probe a node using its primary protocol/port first, and if that fails with a
+    non-systemic / non-auth error, automatically try:
+      1. Alternative OpenVPN protocols & ports (UDP <-> TCP on same port, TCP 443, 995, 1194, 1698, 5555, UDP 1194, 1195)
+      2. SoftEther SSL-VPN ('sslvpn') over HTTPS port
+      3. MS-SSTP ('sstp') over HTTPS port (when sstpc is installed)
+      4. <HostName>.opengw.net DDNS IP resolution if the volunteer node's dynamic residential IP rotated
     Returns (ok, message, effective_proto, effective_port, effective_config_text).
     """
     p_timeout = primary_timeout if primary_timeout is not None else OPENVPN_PROBE_TIMEOUT_SECONDS
@@ -2285,9 +2610,12 @@ def probe_openvpn_with_protocol_fallbacks(
     eff_host = remote_host or parsed_host
     eff_port = int(primary_port or parsed_port or 0)
     raw_proto = primary_proto if primary_proto and primary_proto != "unknown" else parsed_proto
-    eff_proto = vpn_utils.normalize_openvpn_proto(raw_proto)
+    eff_proto = vpn_utils.normalize_vpn_protocol(raw_proto)
     if eff_port <= 0:
-        eff_port = 443 if eff_proto == "tcp" else 1194
+        eff_port = 443 if eff_proto in ("tcp", "sslvpn", "sstp") else 1194
+
+    dev_idx_m = re.search(r"(\d+)$", str(dev or "tun2"))
+    unit_idx = int(dev_idx_m.group(1)) if dev_idx_m else 2
 
     temp_path = test_config_path(node_id)
     try:
@@ -2296,18 +2624,67 @@ def probe_openvpn_with_protocol_fallbacks(
     except Exception as exc:
         return False, f"Failed to write temp config file: {exc}", eff_proto, eff_port, config_text
 
-    try:
-        ok, message, _ = run_openvpn_until_ready(
+    def _probe_single_candidate(
+        c_host: str,
+        c_proto: str,
+        c_port: int,
+        c_timeout: int,
+        base_cfg: str,
+    ) -> tuple[bool, str, str]:
+        norm_p = vpn_utils.normalize_vpn_protocol(c_proto)
+        if norm_p == "sslvpn":
+            ok_se, msg_se, _, _, _ = run_softether_sslvpn_until_ready(
+                c_host,
+                c_port,
+                keep_alive=False,
+                timeout=min(5, c_timeout),
+                cancel_event=cancel_event,
+            )
+            return ok_se, msg_se, base_cfg
+        if norm_p == "sstp":
+            ok_ss, msg_ss, _, _ = run_sstp_until_ready(
+                c_host,
+                c_port,
+                keep_alive=False,
+                timeout=c_timeout,
+                unit=unit_idx,
+                cancel_event=cancel_event,
+                track_pending=track_pending,
+            )
+            return ok_ss, msg_ss, base_cfg
+
+        rewritten = vpn_utils.rewrite_openvpn_endpoint(base_cfg, c_host, c_port, norm_p)
+        try:
+            temp_path.write_text(rewritten, encoding="utf-8")
+        except Exception as exc:
+            return False, f"Failed to write temp config: {exc}", base_cfg
+        ok_ov, msg_ov, _ = run_openvpn_until_ready(
             str(temp_path),
             keep_alive=False,
             route_nopull=True,
-            timeout=p_timeout,
+            timeout=c_timeout,
             dev=dev,
             cancel_event=cancel_event,
             track_pending=track_pending,
         )
+        return ok_ov, msg_ov, rewritten
+
+    try:
+        if eff_proto in ("sslvpn", "sstp"):
+            ok, message, eff_cfg = _probe_single_candidate(eff_host, eff_proto, eff_port, p_timeout, config_text)
+        else:
+            ok, message, _ = run_openvpn_until_ready(
+                str(temp_path),
+                keep_alive=False,
+                route_nopull=True,
+                timeout=p_timeout,
+                dev=dev,
+                cancel_event=cancel_event,
+                track_pending=track_pending,
+            )
+            eff_cfg = config_text
         if ok:
-            return True, message, eff_proto, eff_port, config_text
+            return True, message, eff_proto, eff_port, eff_cfg
 
         msg_lower = str(message or "").lower()
         if (
@@ -2322,43 +2699,54 @@ def probe_openvpn_with_protocol_fallbacks(
         ):
             return False, message, eff_proto, eff_port, config_text
 
-        candidates = vpn_utils.generate_openvpn_fallback_endpoints(eff_host, eff_port, eff_proto)
-        if not candidates:
-            return False, message, eff_proto, eff_port, config_text
-
         phys_dev = vpn_utils.get_physical_interface()
+        sstpc_available = bool(vpn_utils.find_sstpc_binary())
+
+        hosts_to_try = [eff_host]
+        ddns_ip = vpn_utils.resolve_vpngate_ddns_ip(host_name, eff_host) if host_name else ""
+        if ddns_ip and ddns_ip not in hosts_to_try:
+            hosts_to_try.append(ddns_ip)
+
         tried = 0
-        for cand_proto, cand_port in candidates:
-            if tried >= max_fallbacks:
-                break
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            if cand_proto == "tcp":
-                # Fast TCP reachability pre-check (1.8s) to avoid wasting OpenVPN handshake time on closed TCP ports
-                if vpn_utils.tcp_latency_ms(eff_host, cand_port, phys_dev, timeout=1.8) <= 0:
-                    continue
-
-            alt_config = vpn_utils.rewrite_openvpn_endpoint(config_text, eff_host, cand_port, cand_proto)
-            try:
-                temp_path.write_text(alt_config, encoding="utf-8")
-            except Exception:
-                continue
-
-            tried += 1
-            alt_ok, alt_msg, _ = run_openvpn_until_ready(
-                str(temp_path),
-                keep_alive=False,
-                route_nopull=True,
-                timeout=f_timeout,
-                dev=dev,
-                cancel_event=cancel_event,
-                track_pending=track_pending,
+        orig_label = vpn_utils.format_vpn_protocol_label(eff_proto)
+        for idx_host, target_host in enumerate(hosts_to_try):
+            candidates = vpn_utils.generate_openvpn_fallback_endpoints(
+                target_host,
+                eff_port,
+                eff_proto,
+                include_non_openvpn=True,
             )
-            if alt_ok:
-                rescue_msg = f"{alt_msg} [多协议回退成功: {eff_proto.upper()}:{eff_port} -> {cand_proto.upper()}:{cand_port}]"
-                return True, rescue_msg, cand_proto, cand_port, alt_config
-            if is_systemic_probe_failure(alt_msg):
-                return False, alt_msg, eff_proto, eff_port, config_text
+            if idx_host > 0:
+                # For DDNS-updated IP, try primary proto/port first!
+                candidates = [(eff_proto, eff_port)] + [c for c in candidates if c != (eff_proto, eff_port)]
+
+            for cand_proto, cand_port in candidates:
+                if tried >= max_fallbacks:
+                    break
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                if cand_proto == "sstp" and not sstpc_available:
+                    continue
+                if cand_proto in ("tcp", "sslvpn", "sstp"):
+                    # Fast TCP reachability pre-check (1.8s) to avoid wasting time on closed TCP ports
+                    if vpn_utils.tcp_latency_ms(target_host, cand_port, phys_dev, timeout=1.8) <= 0:
+                        continue
+
+                tried += 1
+                alt_ok, alt_msg, alt_config = _probe_single_candidate(
+                    target_host,
+                    cand_proto,
+                    cand_port,
+                    f_timeout,
+                    config_text,
+                )
+                if alt_ok:
+                    cand_label = vpn_utils.format_vpn_protocol_label(cand_proto)
+                    ddns_note = f", DDNS追回IP:{target_host}" if target_host != eff_host else ""
+                    rescue_msg = f"{alt_msg} [多协议回退成功: {orig_label}:{eff_port} -> {cand_label}:{cand_port}{ddns_note}]"
+                    return True, rescue_msg, cand_proto, cand_port, alt_config
+                if is_systemic_probe_failure(alt_msg):
+                    return False, alt_msg, eff_proto, eff_port, config_text
 
         return False, message, eff_proto, eff_port, config_text
     finally:
@@ -2378,6 +2766,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         h = str(node.get("remote_host") or node.get("ip"))
         p = parse_int(node.get("remote_port"))
         proto = str(node.get("proto") or "")
+        host_name = str(node.get("host_name") or "")
         cfg_file_str = str(node.get("config_file") or "")
         fallback_ping = parse_int(node.get("ping"))
 
@@ -2395,7 +2784,8 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
             dev=f"tun{idx}",
             primary_timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
             fallback_timeout=OPENVPN_FALLBACK_TIMEOUT_SECONDS,
-            max_fallbacks=4,
+            max_fallbacks=6,
+            host_name=host_name,
         )
     finally:
         if idx is not None:
@@ -2474,6 +2864,7 @@ def test_multiple_nodes(
         h = str(n_info.get("remote_host") or n_info.get("ip"))
         p = parse_int(n_info.get("remote_port"))
         proto = str(n_info.get("proto") or "")
+        host_name = str(n_info.get("host_name") or "")
         cfg_file_str = str(n_info.get("config_file") or "")
         fallback_ping = parse_int(n_info.get("ping"))
         
@@ -2491,8 +2882,9 @@ def test_multiple_nodes(
                 dev=dev_name,
                 primary_timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
                 fallback_timeout=OPENVPN_FALLBACK_TIMEOUT_SECONDS,
-                max_fallbacks=2,
+                max_fallbacks=4,
                 cancel_event=cancel_event,
+                host_name=host_name,
             )
         finally:
             if tun_idx is not None:
@@ -2540,7 +2932,7 @@ def test_multiple_nodes(
                 for current in current_nodes:
                     if current.get("id") in batch_ids and not current.get("active"):
                         current["probe_status"] = "testing"
-                        current["probe_message"] = "正在检测节点连通性 (支持 UDP/TCP 多协议回退)..."
+                        current["probe_message"] = "正在检测节点连通性 (支持 UDP/TCP/SSL-VPN/SSTP 多协议回退)..."
                         current["probed_at"] = now
                 write_json(NODES_FILE, sort_all_nodes(current_nodes))
 
@@ -2721,8 +3113,48 @@ def recover_after_manual_connect_failure(previous_node_id: str) -> None:
     if ui_cfg.get("connection_enabled", True) and ui_cfg.get("routing_mode") != "fixed_ip":
         auto_switch_node()
 
+def _start_tunnel_for_protocol(
+    proto: str,
+    remote_host: str,
+    port: int,
+    config_path: Path,
+    cancel_event: threading.Event | None = None,
+    timeout: int | None = None,
+) -> tuple[bool, str, Any, str, str]:
+    norm_p = vpn_utils.normalize_vpn_protocol(proto)
+    if norm_p == "sslvpn":
+        return run_softether_sslvpn_until_ready(
+            remote_host,
+            port,
+            keep_alive=True,
+            timeout=timeout or 25,
+            cancel_event=cancel_event,
+        )
+    if norm_p == "sstp":
+        ok_s, msg_s, proc_s, dev_s = run_sstp_until_ready(
+            remote_host,
+            port,
+            keep_alive=True,
+            timeout=timeout or 25,
+            unit=0,
+            cancel_event=cancel_event,
+            track_pending=True,
+        )
+        return ok_s, msg_s, proc_s, dev_s, ""
+    ok_o, msg_o, proc_o = run_openvpn_until_ready(
+        str(config_path),
+        keep_alive=True,
+        route_nopull=True,
+        timeout=timeout,
+        dev="tun0",
+        cancel_event=cancel_event,
+        track_pending=True,
+    )
+    return ok_o, msg_o, proc_o, "tun0", ""
+
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id
+    global active_tunnel_interface, active_tunnel_protocol
     global last_active_ping_time, last_active_latency
     global consecutive_proxy_failures, last_proxy_failure_node_id
     node_id = str(node_id or "").strip()
@@ -2761,12 +3193,13 @@ def connect_node(node_id: str) -> str:
             DATA_DIR.mkdir(exist_ok=True, parents=True)
             write_json(auth_file, ui_cfg)
 
-        set_state(active_node_latency="写入配置", last_check_message="正在写入 OpenVPN 节点配置文件...")
+        set_state(active_node_latency="写入配置", last_check_message="正在写入 VPN 节点配置文件...")
         config_path = Path(node["config_file"])
         config_text = str(node.get("config_text") or "")
         remote_host = str(node.get("remote_host") or node.get("ip") or "")
+        host_name = str(node.get("host_name") or "")
         eff_port = parse_int(node.get("remote_port"))
-        eff_proto = vpn_utils.normalize_openvpn_proto(node.get("proto"))
+        eff_proto = vpn_utils.normalize_vpn_protocol(node.get("proto"))
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
             config_path.write_text(config_text, encoding="utf-8")
@@ -2781,7 +3214,7 @@ def connect_node(node_id: str) -> str:
             and time.time() - probed_at > SWITCH_PREFLIGHT_MAX_AGE_SECONDS
         )
         if should_preflight:
-            set_state(active_node_latency="切换预检", last_check_message="正在保持当前连接并预检目标节点 (支持 UDP/TCP 多协议回退)...")
+            set_state(active_node_latency="切换预检", last_check_message="正在保持当前连接并预检目标节点 (支持 UDP/TCP/SSL-VPN/SSTP 多协议回退)...")
             test_index = None
             try:
                 test_index = get_free_test_index()
@@ -2794,9 +3227,10 @@ def connect_node(node_id: str) -> str:
                     dev=f"tun{test_index}",
                     primary_timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
                     fallback_timeout=OPENVPN_FALLBACK_TIMEOUT_SECONDS,
-                    max_fallbacks=3,
+                    max_fallbacks=4,
                     cancel_event=cancel_event,
                     track_pending=True,
+                    host_name=host_name,
                 )
             finally:
                 if test_index is not None:
@@ -2815,15 +3249,15 @@ def connect_node(node_id: str) -> str:
                 raise RuntimeError(f"目标节点预检失败，已保留当前连接: {preflight_message}")
             if pf_config and pf_config != config_text:
                 config_text = pf_config
-                eff_proto = pf_proto
-                eff_port = pf_port
-                node["config_text"] = config_text
-                node["proto"] = eff_proto
-                node["remote_port"] = eff_port
                 try:
                     config_path.write_text(config_text, encoding="utf-8")
                 except Exception:
                     pass
+            eff_proto = pf_proto
+            eff_port = pf_port
+            node["config_text"] = config_text
+            node["proto"] = eff_proto
+            node["remote_port"] = eff_port
 
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
@@ -2831,13 +3265,14 @@ def connect_node(node_id: str) -> str:
         stop_active_openvpn()
         stopped_existing = True
 
-        set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
-        ok, message, process = run_openvpn_until_ready(
-            str(config_path),
-            keep_alive=True,
-            route_nopull=True,
+        proto_label = vpn_utils.format_vpn_protocol_label(eff_proto)
+        set_state(active_node_latency="启动核心", last_check_message=f"正在启动 {proto_label} 核心服务并建立隧道连接...")
+        ok, message, process, tunnel_dev, tunnel_gw = _start_tunnel_for_protocol(
+            eff_proto,
+            remote_host,
+            eff_port,
+            config_path,
             cancel_event=cancel_event,
-            track_pending=True,
         )
         if not connection_attempt_is_current(token, cancel_event):
             stop_process(process)
@@ -2851,40 +3286,58 @@ def connect_node(node_id: str) -> str:
                 and "err_ovpn_auth_failed" not in msg_lower
                 and "连接操作已取消" not in msg_lower
             ):
-                fallback_candidates = vpn_utils.generate_openvpn_fallback_endpoints(remote_host, eff_port, eff_proto)
+                fallback_candidates = vpn_utils.generate_openvpn_fallback_endpoints(
+                    remote_host,
+                    eff_port,
+                    eff_proto,
+                    include_non_openvpn=True,
+                )
                 phys_dev = vpn_utils.get_physical_interface()
+                sstpc_available = bool(vpn_utils.find_sstpc_binary())
+                se_vc, se_vcmd = vpn_utils.find_softether_binaries()
+                se_available = bool(se_vc and se_vcmd)
                 tried_fb = 0
                 for cand_proto, cand_port in fallback_candidates:
-                    if tried_fb >= 3 or not connection_attempt_is_current(token, cancel_event):
+                    if tried_fb >= 4 or not connection_attempt_is_current(token, cancel_event):
                         break
-                    if cand_proto == "tcp":
+                    if cand_proto == "sstp" and not sstpc_available:
+                        continue
+                    if cand_proto == "sslvpn" and not se_available:
+                        continue
+                    if cand_proto in ("tcp", "sslvpn", "sstp"):
                         if vpn_utils.tcp_latency_ms(remote_host, cand_port, phys_dev, timeout=1.8) <= 0:
                             continue
-                    alt_config = vpn_utils.rewrite_openvpn_endpoint(config_text, remote_host, cand_port, cand_proto)
-                    try:
-                        config_path.write_text(alt_config, encoding="utf-8")
-                    except Exception:
-                        continue
+                    alt_config = config_text
+                    if cand_proto in ("tcp", "udp"):
+                        alt_config = vpn_utils.rewrite_openvpn_endpoint(config_text, remote_host, cand_port, cand_proto)
+                        try:
+                            config_path.write_text(alt_config, encoding="utf-8")
+                        except Exception:
+                            continue
                     tried_fb += 1
+                    cand_label = vpn_utils.format_vpn_protocol_label(cand_proto)
                     set_state(
-                        active_node_latency=f"尝试 {cand_proto.upper()}:{cand_port}",
-                        last_check_message=f"默认协议未响应，正在尝试备用协议 {cand_proto.upper()}:{cand_port}...",
+                        active_node_latency=f"尝试 {cand_label}:{cand_port}",
+                        last_check_message=f"默认协议未响应，正在尝试备用协议 {cand_label}:{cand_port}...",
                     )
-                    fb_ok, fb_msg, fb_proc = run_openvpn_until_ready(
-                        str(config_path),
-                        keep_alive=True,
-                        route_nopull=True,
-                        timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
+                    fb_ok, fb_msg, fb_proc, fb_dev, fb_gw = _start_tunnel_for_protocol(
+                        cand_proto,
+                        remote_host,
+                        cand_port,
+                        config_path,
                         cancel_event=cancel_event,
-                        track_pending=True,
+                        timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
                     )
                     if not connection_attempt_is_current(token, cancel_event):
                         stop_process(fb_proc)
                         raise ConnectionCancelled("连接操作已取消")
                     if fb_ok and fb_proc is not None:
                         ok = True
-                        message = f"{fb_msg} [多协议回退成功: {eff_proto.upper()}:{eff_port} -> {cand_proto.upper()}:{cand_port}]"
+                        orig_label = vpn_utils.format_vpn_protocol_label(eff_proto)
+                        message = f"{fb_msg} [多协议回退成功: {orig_label}:{eff_port} -> {cand_label}:{cand_port}]"
                         process = fb_proc
+                        tunnel_dev = fb_dev
+                        tunnel_gw = fb_gw
                         config_text = alt_config
                         eff_proto = cand_proto
                         eff_port = cand_port
@@ -2917,10 +3370,12 @@ def connect_node(node_id: str) -> str:
                 raise ConnectionCancelled("连接操作已取消")
             active_openvpn_process = process
             active_openvpn_node_id = node_id
+            active_tunnel_interface = tunnel_dev
+            active_tunnel_protocol = eff_proto
         set_state(tunnel_ready=True, proxy_ready=False)
         
-        set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
-        routing_ready = setup_policy_routing("tun0")
+        set_state(active_node_latency="配置路由", last_check_message=f"正在为虚拟网卡 {tunnel_dev} 配置策略路由规则与流量转发...")
+        routing_ready = setup_policy_routing(tunnel_dev, gateway_ip=tunnel_gw)
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
         
@@ -2953,6 +3408,7 @@ def connect_node(node_id: str) -> str:
             latest_ui_cfg["fixed_node_id"] = node_id
 
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
+        final_proto_label = vpn_utils.format_vpn_protocol_label(eff_proto)
         with lock:
             if not connection_attempt_is_current(token, cancel_event):
                 raise ConnectionCancelled("连接操作已取消")
@@ -2966,7 +3422,7 @@ def connect_node(node_id: str) -> str:
                     item["remote_port"] = eff_port
                     item["config_text"] = config_text
                     _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
-                    item["probe_message"] = f"Active node ({eff_proto.upper()}:{eff_port}). HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
+                    item["probe_message"] = f"Active node ({final_proto_label}:{eff_port} via {tunnel_dev}). HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
             sorted_current = sort_all_nodes(current_nodes)
             write_json(NODES_FILE, sorted_current)
             try:
@@ -2980,7 +3436,7 @@ def connect_node(node_id: str) -> str:
                 active_openvpn_node_id=node_id,
                 is_connecting=False,
                 pending_node_id="",
-                last_check_message=f"Connected {node_id} ({eff_proto.upper()}:{eff_port})",
+                last_check_message=f"Connected {node_id} ({final_proto_label}:{eff_port})",
                 active_node_latency=latency_str,
                 proxy_ok=True,
                 tunnel_ready=True,
@@ -2989,7 +3445,7 @@ def connect_node(node_id: str) -> str:
                 proxy_latency_ms=res["latency_ms"],
                 proxy_error="",
             )
-        log_to_json("INFO", "VPN", f"节点 {node_id} ({eff_proto.upper()}:{eff_port}) 连接成功，出口网卡 tun0 已启用")
+        log_to_json("INFO", "VPN", f"节点 {node_id} ({final_proto_label}:{eff_port}) 连接成功，出口网卡 {tunnel_dev} 已启用")
         cancel_background_refill()
         return f"Connected {node_id}"
     except ConnectionCancelled:
@@ -6162,7 +6618,7 @@ function render() {
       const cName = translateCountry(n.country);
       const reg = getNodeRegion(n) || (n.location && n.location !== cName ? n.location : "");
       const keepBadge = (isFav && n.in_latest_feed === false) ? '<span class="keep" title="该收藏节点已由本地快照防丢保活">★ 保活</span>' : '';
-      const protoStr = String(n.proto || 'udp').toUpperCase();
+      const rawP = String(n.proto || 'udp').toLowerCase(); const protoStr = rawP === 'sslvpn' ? 'SSL-VPN' : (rawP === 'sstp' ? 'SSTP' : rawP.toUpperCase());
       const isProtoRescued = String(n.probe_message || '').includes('多协议回退成功');
       const tKey = n.ip_type === 'hosting' ? 'core' : (n.ip_type === 'mobile' ? 'direct' : 'edge');
       const nativeSub = (n.cleanip_is_native || n.intel_is_native) ? '原生住宅段' : (n.ip_type === 'hosting' ? '数据中心段' : 'ISP 宽带接入');
@@ -7621,12 +8077,13 @@ def check_proxy_health() -> dict[str, Any]:
             except Exception:
                 pass
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
-    if sys.platform.startswith("linux") and not tun_path.exists():
+    # 2. 检测当前活动虚拟网卡 (tun0 / ppp0 / vpn_se) 是否存在 (Linux 下)
+    active_dev = active_tunnel_interface or "tun0"
+    tun_path = Path(f"/sys/class/net/{active_dev}")
+    if sys.platform.startswith("linux") and not tun_path.exists() and not Path("/sys/class/net/tun0").exists():
         return {
             "ok": False,
-            "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+            "error": f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 ({active_dev}) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
@@ -8047,8 +8504,9 @@ class Handler(BaseHTTPRequestHandler):
             if ovpn_ok:
                 ovpn_details = f"已连接节点: {active_openvpn_node_id}"
                 if sys.platform.startswith("linux"):
-                    if not Path("/sys/class/net/tun0").exists():
-                        ovpn_err = "[警告] 虚拟网卡 (tun0) 未启用，可能存在策略路由配置问题。"
+                    active_dev = active_tunnel_interface or "tun0"
+                    if not Path(f"/sys/class/net/{active_dev}").exists() and not Path("/sys/class/net/tun0").exists():
+                        ovpn_err = f"[警告] 虚拟网卡 ({active_dev}) 未启用，可能存在策略路由配置问题。"
             else:
                 if active_openvpn_node_id:
                     ovpn_err = "连接已中断或 OpenVPN 核心程序异常退出。"

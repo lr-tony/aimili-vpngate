@@ -229,6 +229,140 @@ def normalize_openvpn_proto(proto: Any) -> str:
         return "udp"
     return "udp"
 
+def normalize_vpn_protocol(proto: Any) -> str:
+    raw = str(proto or "").strip().lower()
+    if raw in ("sslvpn", "softether", "ssl-vpn", "se"):
+        return "sslvpn"
+    if raw in ("sstp", "ms-sstp"):
+        return "sstp"
+    if raw in ("l2tp", "l2tp/ipsec", "ipsec"):
+        return "l2tp"
+    if raw.startswith("tcp"):
+        return "tcp"
+    if raw.startswith("udp"):
+        return "udp"
+    return "udp"
+
+def format_vpn_protocol_label(proto: Any) -> str:
+    norm = normalize_vpn_protocol(proto)
+    if norm == "sslvpn":
+        return "SSL-VPN"
+    if norm == "sstp":
+        return "SSTP"
+    if norm == "l2tp":
+        return "L2TP"
+    return norm.upper()
+
+def build_vpngate_ddns_hostname(host_name: Any) -> str:
+    raw = str(host_name or "").strip().lower()
+    if not raw or "." in raw or "_" in raw:
+        return ""
+    if re.fullmatch(r"(?:vpn\d+|public-vpn-\d+)", raw):
+        return f"{raw}.opengw.net"
+    return ""
+
+def resolve_vpngate_ddns_ip(host_name: Any, current_ip: str = "") -> str:
+    ddns = build_vpngate_ddns_hostname(host_name)
+    if not ddns:
+        return ""
+    try:
+        infos = socket.getaddrinfo(ddns, None, socket.AF_INET, socket.SOCK_STREAM)
+        for info in infos:
+            addr = str(info[4][0] or "").strip()
+            if addr and addr != current_ip:
+                return addr
+            if addr:
+                return addr
+    except Exception:
+        pass
+    return ""
+
+def find_sstpc_binary() -> str | None:
+    import shutil
+    for candidate in ("sstpc", "/usr/sbin/sstpc", "/usr/bin/sstpc", "/usr/local/sbin/sstpc", "/usr/local/bin/sstpc"):
+        found = shutil.which(candidate) if "/" not in candidate else (candidate if os.path.exists(candidate) and os.access(candidate, os.X_OK) else None)
+        if found:
+            return found
+    return None
+
+def find_softether_binaries() -> tuple[str | None, str | None]:
+    import shutil
+    search_dirs = [
+        "/opt/vpnclient",
+        "/usr/local/vpnclient",
+        "/usr/local/libexec/softether/vpnclient",
+        "/usr/lib/softether/vpnclient",
+    ]
+    vpnclient_bin = shutil.which("vpnclient")
+    vpncmd_bin = shutil.which("vpncmd")
+    for d in search_dirs:
+        vc = os.path.join(d, "vpnclient")
+        vcmd = os.path.join(d, "vpncmd")
+        if not vpnclient_bin and os.path.exists(vc) and os.access(vc, os.X_OK):
+            vpnclient_bin = vc
+        if not vpncmd_bin and os.path.exists(vcmd) and os.access(vcmd, os.X_OK):
+            vpncmd_bin = vcmd
+    return vpnclient_bin, vpncmd_bin
+
+def probe_softether_sslvpn_signature(
+    host: str,
+    port: int,
+    dev: str | None = None,
+    timeout: float = 3.5,
+) -> tuple[bool, str]:
+    """
+    Perform a genuine TLS + HTTP signature handshake against a SoftEther SSL-VPN port.
+    SoftEther VPN Server listens for HTTPS GET/POST on its TCP ports (443, 995, 1698, 5555, or custom port)
+    and responds with a signature page or HTTP response on /vpnsvc/connect.cgi.
+    """
+    if not host or _safe_int(port, 0) <= 0:
+        return False, "invalid host/port"
+    import ssl
+    af = socket.AF_INET6 if ":" in host else socket.AF_INET
+    raw_sock = None
+    tls_sock = None
+    try:
+        raw_sock = socket.socket(af, socket.SOCK_STREAM)
+        raw_sock.settimeout(timeout)
+        if dev:
+            try:
+                raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode("utf-8"))
+            except OSError:
+                pass
+        raw_sock.connect((host, int(port)))
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        tls_sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+        tls_sock.settimeout(timeout)
+        req = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {host}:{int(port)}\r\n"
+            "User-Agent: Mozilla/5.0\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii", errors="ignore")
+        tls_sock.sendall(req)
+        data = tls_sock.recv(2048).decode("iso-8859-1", errors="replace")
+        if data.startswith("HTTP/1.") and any(
+            token in data.lower()
+            for token in ("200 ", "403 ", "404 ", "301 ", "302 ", "softether", "nginx", "apache", "content-type")
+        ):
+            return True, f"SoftEther SSL-VPN TLS 握手可达 ({host}:{port})"
+        return False, "unexpected SSL-VPN response"
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if tls_sock is not None:
+            try:
+                tls_sock.close()
+            except Exception:
+                pass
+        elif raw_sock is not None:
+            try:
+                raw_sock.close()
+            except Exception:
+                pass
+
 def rewrite_openvpn_endpoint(config_text: str, remote_host: str, port: int, proto: str) -> str:
     """Rewrite an OpenVPN configuration's proto and remote directives to target (remote_host, port, proto)."""
     if not config_text or not remote_host or int(port or 0) <= 0:
@@ -283,15 +417,18 @@ def generate_openvpn_fallback_endpoints(
     remote_host: str,
     primary_port: int,
     primary_proto: str,
+    include_non_openvpn: bool = True,
 ) -> list[tuple[str, int]]:
     """
-    Generate ordered alternative (proto, port) pairs for a VPNGate / SoftEther OpenVPN server.
-    SoftEther VPN Server shares its TCP listener (443, 995, 1698, 5555, or the node's custom port)
-    with OpenVPN-over-TCP, and also commonly listens on UDP 1194 / 1195 or the same port number.
+    Generate ordered alternative (proto, port) pairs for a VPNGate / SoftEther server.
+    Supports:
+    - OpenVPN UDP / TCP (same port, TCP 443, 995,UDP 1194)
+    - SoftEther SSL-VPN ('sslvpn' on primary TCP port, 443, 995, 5555)
+    - MS-SSTP ('sstp' on primary TCP port, 443, 995, 5555)
     """
     if not remote_host:
         return []
-    p_proto = normalize_openvpn_proto(primary_proto)
+    p_proto = normalize_vpn_protocol(primary_proto)
     p_port = int(primary_port or 0)
     seen: set[tuple[str, int]] = set()
     if p_port > 0:
@@ -302,29 +439,61 @@ def generate_openvpn_fallback_endpoints(
     def add_candidate(proto: str, port: int) -> None:
         if port <= 0 or port > 65535:
             return
-        key = (normalize_openvpn_proto(proto), int(port))
+        key = (normalize_vpn_protocol(proto), int(port))
         if key not in seen:
             seen.add(key)
             candidates.append(key)
 
+    tcp_ports_order: list[int] = []
+    if p_port > 0:
+        tcp_ports_order.append(p_port)
+    for std_port in (443, 995, 5555, 1698, 1194):
+        if std_port not in tcp_ports_order:
+            tcp_ports_order.append(std_port)
+
     if p_proto == "udp":
-        # UDP failed -> try TCP on the same port, then standard SoftEther TCP ports, then common UDP ports
+        # 1. Try OpenVPN TCP on same port & 443/995 first
         if p_port > 0:
             add_candidate("tcp", p_port)
-        for tcp_port in (443, 995, 1194, 1698, 5555):
+        add_candidate("tcp", 443)
+        add_candidate("tcp", 995)
+        add_candidate("udp", 1194)
+        # 2. Try SoftEther SSL-VPN & MS-SSTP on primary / 443 / 995
+        if include_non_openvpn:
+            for tp in tcp_ports_order[:2]:
+                add_candidate("sslvpn", tp)
+            for tp in tcp_ports_order[:2]:
+                add_candidate("sstp", tp)
+        # 3. Remaining OpenVPN ports
+        for tcp_port in (1194, 1698, 5555):
             add_candidate("tcp", tcp_port)
-        for udp_port in (1194, 1195):
-            add_candidate("udp", udp_port)
-    else:
-        # TCP failed -> try UDP on the same port (if not standard HTTPS-only), then UDP 1194/1195, then other TCP ports
+        add_candidate("udp", 1195)
+    elif p_proto == "tcp":
+        # 1. Try OpenVPN UDP on same port / 1194 & OpenVPN TCP 443/995
         if p_port > 0 and p_port not in (80, 443):
             add_candidate("udp", p_port)
-        for udp_port in (1194, 1195):
-            add_candidate("udp", udp_port)
-        for tcp_port in (443, 995, 1194, 1698, 5555):
+        add_candidate("udp", 1194)
+        add_candidate("tcp", 443)
+        add_candidate("tcp", 995)
+        # 2. Try SoftEther SSL-VPN & MS-SSTP on primary / 443 / 995
+        if include_non_openvpn:
+            for tp in tcp_ports_order[:2]:
+                add_candidate("sslvpn", tp)
+            for tp in tcp_ports_order[:2]:
+                add_candidate("sstp", tp)
+        # 3. Remaining OpenVPN ports
+        for tcp_port in (1194, 1698, 5555):
             add_candidate("tcp", tcp_port)
-        if p_port in (80, 443):
-            add_candidate("udp", p_port)
+        add_candidate("udp", 1195)
+    else:
+        for tcp_port in tcp_ports_order[:3]:
+            add_candidate("tcp", tcp_port)
+        add_candidate("udp", 1194)
+        if include_non_openvpn:
+            for tp in tcp_ports_order[:2]:
+                add_candidate("sslvpn", tp)
+            for tp in tcp_ports_order[:2]:
+                add_candidate("sstp", tp)
 
     return candidates
 

@@ -1300,6 +1300,32 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("tcp", stored["proto"])
         self.assertEqual(3040, stored["remote_port"])
 
+    def test_protocol_fallback_supports_softether_sslvpn_and_sstp(self) -> None:
+        nodes = self.write_nodes(1)
+        node = nodes[0]
+        node["proto"] = "udp"
+        node["remote_port"] = 1969
+        node["host_name"] = "vpn379858910"
+        manager.write_json(manager.NODES_FILE, [node])
+
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=24),
+            mock.patch.object(manager.vpn_utils, "tcp_latency_ms", return_value=24),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(manager, "run_openvpn_until_ready", return_value=(False, "OpenVPN timeout", None)),
+            mock.patch.object(
+                manager.vpn_utils,
+                "probe_softether_sslvpn_signature",
+                return_value=(True, "SoftEther SSL-VPN TLS 握手可达"),
+            ),
+        ):
+            res = manager.test_node_by_id(node["id"])
+
+        self.assertEqual("available", res["probe_status"])
+        self.assertEqual("sslvpn", res["proto"])
+        self.assertIn("SSL-VPN", res["probe_message"])
+        self.assertEqual("vpn379858910.opengw.net", manager.vpn_utils.build_vpngate_ddns_hostname(node["host_name"]))
+
 
 class ProxyServerConcurrencyTests(unittest.TestCase):
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
