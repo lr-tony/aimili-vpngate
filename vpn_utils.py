@@ -363,6 +363,113 @@ def probe_softether_sslvpn_signature(
             except Exception:
                 pass
 
+def probe_sstp_signature(
+    host: str,
+    port: int,
+    dev: str | None = None,
+    timeout: float = 3.5,
+) -> tuple[bool, str]:
+    """
+    Perform a genuine MS-SSTP HTTP-over-TLS duplex handshake probe:
+    SSTP_DUPLEX_POST /sra_{BA195980-CD49-458b-9E23-C84EE0ADCD75}/ HTTP/1.1
+    SoftEther VPN Server with MS-SSTP enabled replies with HTTP/1.1 200 OK.
+    """
+    if not host or _safe_int(port, 0) <= 0:
+        return False, "invalid host/port"
+    import ssl
+    af = socket.AF_INET6 if ":" in host else socket.AF_INET
+    raw_sock = None
+    tls_sock = None
+    try:
+        raw_sock = socket.socket(af, socket.SOCK_STREAM)
+        raw_sock.settimeout(timeout)
+        if dev:
+            try:
+                raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode("utf-8"))
+            except OSError:
+                pass
+        raw_sock.connect((host, int(port)))
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        tls_sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+        tls_sock.settimeout(timeout)
+        req = (
+            "SSTP_DUPLEX_POST /sra_{BA195980-CD49-458b-9E23-C84EE0ADCD75}/ HTTP/1.1\r\n"
+            f"Host: {host}:{int(port)}\r\n"
+            "SSTPCORRELATIONID: {00000000-0000-0000-0000-000000000001}\r\n"
+            "Content-Length: 18446744073709551615\r\n\r\n"
+        ).encode("ascii", errors="ignore")
+        tls_sock.sendall(req)
+        data = tls_sock.recv(1024).decode("iso-8859-1", errors="replace")
+        if data.startswith("HTTP/1.1 200") or data.startswith("HTTP/1.0 200"):
+            return True, f"MS-SSTP 隧道握手可达 ({host}:{port})"
+        return False, "unexpected SSTP response"
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if tls_sock is not None:
+            try:
+                tls_sock.close()
+            except Exception:
+                pass
+        elif raw_sock is not None:
+            try:
+                raw_sock.close()
+            except Exception:
+                pass
+
+def detect_node_supported_protocols(
+    host: str,
+    primary_port: int,
+    primary_proto: str,
+    openvpn_ok: bool = False,
+    effective_proto: str = "",
+    effective_port: int = 0,
+    dev: str | None = None,
+) -> list[str]:
+    """
+    Quickly detect which of the 4 VPNGate protocol families (UDP, TCP, SSL-VPN, SSTP)
+    are supported and reachable on this node.
+    """
+    supported: list[str] = []
+
+    def add_p(label: str) -> None:
+        if label and label not in supported:
+            supported.append(label)
+
+    eff_p = normalize_vpn_protocol(effective_proto or primary_proto)
+    if openvpn_ok:
+        add_p(format_vpn_protocol_label(eff_p))
+
+    if not host:
+        return supported
+
+    phys_dev = dev if dev is not None else get_physical_interface()
+    # Pick the best open TCP port on this SoftEther server (primary TCP port or 443 / 995)
+    candidate_tcp_ports: list[int] = []
+    for p in (effective_port, primary_port, 443, 995):
+        p_int = _safe_int(p, 0)
+        if 1 <= p_int <= 65535 and p_int not in candidate_tcp_ports:
+            candidate_tcp_ports.append(p_int)
+
+    open_tcp_port = 0
+    for tp in candidate_tcp_ports[:3]:
+        if tcp_latency_ms(host, tp, phys_dev, timeout=1.2) > 0:
+            open_tcp_port = tp
+            break
+
+    if open_tcp_port > 0:
+        add_p("TCP")
+        se_ok, _ = probe_softether_sslvpn_signature(host, open_tcp_port, dev=phys_dev, timeout=1.8)
+        if se_ok:
+            add_p("SSL-VPN")
+        ss_ok, _ = probe_sstp_signature(host, open_tcp_port, dev=phys_dev, timeout=1.8)
+        if ss_ok:
+            add_p("SSTP")
+
+    return supported
+
 def rewrite_openvpn_endpoint(config_text: str, remote_host: str, port: int, proto: str) -> str:
     """Rewrite an OpenVPN configuration's proto and remote directives to target (remote_host, port, proto)."""
     if not config_text or not remote_host or int(port or 0) <= 0:
@@ -422,7 +529,7 @@ def generate_openvpn_fallback_endpoints(
     """
     Generate ordered alternative (proto, port) pairs for a VPNGate / SoftEther server.
     Supports:
-    - OpenVPN UDP / TCP (same port, TCP 443, 995,UDP 1194)
+    - OpenVPN UDP / TCP (same port, TCP 443, 995, UDP 1194)
     - SoftEther SSL-VPN ('sslvpn' on primary TCP port, 443, 995, 5555)
     - MS-SSTP ('sstp' on primary TCP port, 443, 995, 5555)
     """

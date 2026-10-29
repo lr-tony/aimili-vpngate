@@ -1876,12 +1876,21 @@ def run_sstp_until_ready(
     track_pending: bool = False,
 ) -> tuple[bool, str, Any, str]:
     """
-    Connect or probe a VPNGate node via MS-SSTP protocol using sstpc + pppd.
+    Connect or probe a VPNGate node via MS-SSTP protocol using sstpc + pppd (or TLS SSTP_DUPLEX_POST probe when keep_alive=False).
     Creates ppp{unit} interface.
     """
     global pending_openvpn_process
     sstpc_bin = vpn_utils.find_sstpc_binary()
     dev = f"ppp{unit}"
+    if not keep_alive and not sstpc_bin:
+        phys_dev = vpn_utils.get_physical_interface()
+        sig_ok, sig_msg = vpn_utils.probe_sstp_signature(
+            remote_host,
+            port,
+            dev=phys_dev,
+            timeout=min(4.0, float(timeout or 5)),
+        )
+        return sig_ok, sig_msg, None, dev
     if not sstpc_bin:
         return False, "未安装 sstp-client (sstpc)，跳过 SSTP 协议", None, dev
     limit = timeout if timeout is not None else OPENVPN_PROBE_TIMEOUT_SECONDS
@@ -2725,8 +2734,6 @@ def probe_openvpn_with_protocol_fallbacks(
                     break
                 if cancel_event is not None and cancel_event.is_set():
                     break
-                if cand_proto == "sstp" and not sstpc_available:
-                    continue
                 if cand_proto in ("tcp", "sslvpn", "sstp"):
                     # Fast TCP reachability pre-check (1.8s) to avoid wasting time on closed TCP ports
                     if vpn_utils.tcp_latency_ms(target_host, cand_port, phys_dev, timeout=1.8) <= 0:
@@ -2796,12 +2803,26 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         if re_lat > 0:
             latency = re_lat
 
+    supported_protos = (
+        vpn_utils.detect_node_supported_protocols(
+            host=h,
+            primary_port=p,
+            primary_proto=proto,
+            openvpn_ok=ok,
+            effective_proto=eff_proto,
+            effective_port=eff_port,
+        )
+        if ok
+        else []
+    )
+
     temp_node: dict[str, Any] = {
         "id": node_id,
         "ip": h,
         "remote_host": h,
         "remote_port": eff_port if ok else p,
         "proto": eff_proto if ok else (proto or "udp"),
+        "supported_protocols": supported_protos,
         "owner": "",
         "asn": "",
         "as_name": "",
@@ -2829,6 +2850,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["proto"] = eff_proto
                 node["remote_port"] = eff_port
                 node["config_text"] = eff_config
+                node["supported_protocols"] = supported_protos
                 for field in IP_ENRICHMENT_FIELDS:
                     value = temp_node.get(field)
                     if value not in (None, ""):
@@ -2896,12 +2918,25 @@ def test_multiple_nodes(
             except Exception:
                 pass
             
+        supported_protos = (
+            vpn_utils.detect_node_supported_protocols(
+                host=h,
+                primary_port=p,
+                primary_proto=proto,
+                openvpn_ok=ok,
+                effective_proto=eff_proto,
+                effective_port=eff_port,
+            )
+            if ok
+            else []
+        )
         temp_node: dict[str, Any] = {
             "id": node_id,
             "ip": n_info.get("ip") or h,
             "remote_host": h,
             "remote_port": eff_port if ok else p,
             "proto": eff_proto if ok else (proto or "udp"),
+            "supported_protocols": supported_protos,
             "latency_ms": latency,
             "probe_status": "available" if ok else "unavailable",
             "probe_message": message,
@@ -6648,7 +6683,10 @@ function render() {
       const cName = translateCountry(n.country);
       const reg = getNodeRegion(n) || (n.location && n.location !== cName ? n.location : "");
       const keepBadge = (isFav && n.in_latest_feed === false) ? '<span class="keep" title="该收藏节点已由本地快照防丢保活">★ 保活</span>' : '';
-      const rawP = String(n.proto || 'udp').toLowerCase(); const protoStr = rawP === 'sslvpn' ? 'SSL-VPN' : (rawP === 'sstp' ? 'SSTP' : rawP.toUpperCase());
+      const rawP = String(n.proto || 'udp').toLowerCase();
+      const baseProtoStr = rawP === 'sslvpn' ? 'SSL-VPN' : (rawP === 'sstp' ? 'SSTP' : rawP.toUpperCase());
+      const supProtos = Array.isArray(n.supported_protocols) && n.supported_protocols.length > 0 ? n.supported_protocols.join('/') : baseProtoStr;
+      const protoStr = supProtos;
       const isProtoRescued = String(n.probe_message || '').includes('多协议回退成功');
       const tKey = n.ip_type === 'hosting' ? 'core' : (n.ip_type === 'mobile' ? 'direct' : 'edge');
       const nativeSub = (n.cleanip_is_native || n.intel_is_native) ? '原生住宅段' : (n.ip_type === 'hosting' ? '数据中心段' : 'ISP 宽带接入');

@@ -106,6 +106,17 @@ class ManagerLogicTests(unittest.TestCase):
         manager.background_refill_thread = None
         manager.background_refill_cancel_event.clear()
         manager.active_sessions.clear()
+        self._proto_detect_patch = mock.patch.object(
+            manager.vpn_utils,
+            "detect_node_supported_protocols",
+            side_effect=lambda host, primary_port, primary_proto, openvpn_ok=False, effective_proto="", effective_port=0, dev=None: (
+                [manager.vpn_utils.format_vpn_protocol_label(effective_proto or primary_proto)]
+                if openvpn_ok
+                else []
+            ),
+        )
+        self._proto_detect_patch.start()
+        self.path_patches.append(self._proto_detect_patch)
 
     def tearDown(self) -> None:
         if manager.connection_attempt_lock.locked():
