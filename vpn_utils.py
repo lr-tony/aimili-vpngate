@@ -429,7 +429,7 @@ def detect_node_supported_protocols(
     dev: str | None = None,
 ) -> list[str]:
     """
-    Quickly detect which of the 4 VPNGate protocol families (UDP, TCP, SSL-VPN, SSTP)
+    Quickly detect which of the VPNGate protocol families (UDP, TCP, SSL-VPN, SSTP)
     are supported and reachable on this node.
     """
     supported: list[str] = []
@@ -446,9 +446,8 @@ def detect_node_supported_protocols(
         return supported
 
     phys_dev = dev if dev is not None else get_physical_interface()
-    # Pick the best open TCP port on this SoftEther server (primary TCP port or 443 / 995)
     candidate_tcp_ports: list[int] = []
-    for p in (effective_port, primary_port, 443, 995):
+    for p in (effective_port, primary_port, 443, 995, 5555):
         p_int = _safe_int(p, 0)
         if 1 <= p_int <= 65535 and p_int not in candidate_tcp_ports:
             candidate_tcp_ports.append(p_int)
@@ -528,10 +527,11 @@ def generate_openvpn_fallback_endpoints(
 ) -> list[tuple[str, int]]:
     """
     Generate ordered alternative (proto, port) pairs for a VPNGate / SoftEther server.
-    Supports:
-    - OpenVPN UDP / TCP (same port, TCP 443, 995, UDP 1194)
-    - SoftEther SSL-VPN ('sslvpn' on primary TCP port, 443, 995, 5555)
-    - MS-SSTP ('sstp' on primary TCP port, 443, 995, 5555)
+    Interleaves all 3 major protocol families so every fallback sweep tests:
+      1. Alternative OpenVPN transport (TCP <-> UDP)
+      2. SoftEther SSL-VPN ('sslvpn')
+      3. MS-SSTP ('sstp')
+      4. Additional common ports (443, 995, 1194, 5555)
     """
     if not remote_host:
         return []
@@ -558,49 +558,54 @@ def generate_openvpn_fallback_endpoints(
         if std_port not in tcp_ports_order:
             tcp_ports_order.append(std_port)
 
+    first_tcp = tcp_ports_order[0] if tcp_ports_order else 443
+    second_tcp = tcp_ports_order[1] if len(tcp_ports_order) > 1 else 443
+
     if p_proto == "udp":
-        # 1. Try OpenVPN TCP on same port & 443/995 first
+        # 1. OpenVPN TCP on same port & 443
         if p_port > 0:
             add_candidate("tcp", p_port)
         add_candidate("tcp", 443)
+        # 2. SoftEther SSL-VPN & MS-SSTP immediately next so all 3 protocol families are tested
+        if include_non_openvpn:
+            add_candidate("sslvpn", first_tcp)
+            if second_tcp != first_tcp:
+                add_candidate("sslvpn", second_tcp)
+            add_candidate("sstp", first_tcp)
+            if second_tcp != first_tcp:
+                add_candidate("sstp", second_tcp)
+        # 3. Remaining OpenVPN ports
         add_candidate("tcp", 995)
         add_candidate("udp", 1194)
-        # 2. Try SoftEther SSL-VPN & MS-SSTP on primary / 443 / 995
-        if include_non_openvpn:
-            for tp in tcp_ports_order[:2]:
-                add_candidate("sslvpn", tp)
-            for tp in tcp_ports_order[:2]:
-                add_candidate("sstp", tp)
-        # 3. Remaining OpenVPN ports
         for tcp_port in (1194, 1698, 5555):
             add_candidate("tcp", tcp_port)
         add_candidate("udp", 1195)
     elif p_proto == "tcp":
-        # 1. Try OpenVPN UDP on same port / 1194 & OpenVPN TCP 443/995
+        # 1. OpenVPN UDP on same port / 1194 & OpenVPN TCP 443
         if p_port > 0 and p_port not in (80, 443):
             add_candidate("udp", p_port)
         add_candidate("udp", 1194)
         add_candidate("tcp", 443)
-        add_candidate("tcp", 995)
-        # 2. Try SoftEther SSL-VPN & MS-SSTP on primary / 443 / 995
+        # 2. SoftEther SSL-VPN & MS-SSTP immediately next so all 3 protocol families are tested
         if include_non_openvpn:
-            for tp in tcp_ports_order[:2]:
-                add_candidate("sslvpn", tp)
-            for tp in tcp_ports_order[:2]:
-                add_candidate("sstp", tp)
+            add_candidate("sslvpn", first_tcp)
+            if second_tcp != first_tcp:
+                add_candidate("sslvpn", second_tcp)
+            add_candidate("sstp", first_tcp)
+            if second_tcp != first_tcp:
+                add_candidate("sstp", second_tcp)
         # 3. Remaining OpenVPN ports
+        add_candidate("tcp", 995)
         for tcp_port in (1194, 1698, 5555):
             add_candidate("tcp", tcp_port)
         add_candidate("udp", 1195)
     else:
-        for tcp_port in tcp_ports_order[:3]:
+        for tcp_port in tcp_ports_order[:2]:
             add_candidate("tcp", tcp_port)
         add_candidate("udp", 1194)
         if include_non_openvpn:
-            for tp in tcp_ports_order[:2]:
-                add_candidate("sslvpn", tp)
-            for tp in tcp_ports_order[:2]:
-                add_candidate("sstp", tp)
+            add_candidate("sslvpn", first_tcp)
+            add_candidate("sstp", first_tcp)
 
     return candidates
 

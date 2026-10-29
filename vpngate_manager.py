@@ -1797,15 +1797,16 @@ def run_openvpn_until_ready(
     else:
         message = f"OpenVPN timeout after {limit}s."
 
-    # Bulk write accumulated startup logs
-    for line_str in openvpn_logs:
-        level = "INFO"
-        line_lower = line_str.lower()
-        if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
-            level = "ERROR"
-        elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
-            level = "WARNING"
-        log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
+    # Write full startup logs for active connection (keep_alive=True); for background probes only log warnings/errors to prevent flooding Web Logs
+    if keep_alive:
+        for line_str in openvpn_logs:
+            level = "INFO"
+            line_lower = line_str.lower()
+            if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
+                level = "ERROR"
+            elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
+                level = "WARNING"
+            log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
 
     if not ok and not cancelled:
         err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail)
@@ -2740,6 +2741,12 @@ def probe_openvpn_with_protocol_fallbacks(
                         continue
 
                 tried += 1
+                cand_label = vpn_utils.format_vpn_protocol_label(cand_proto)
+                log_to_json(
+                    "INFO",
+                    "VPN",
+                    f"[多协议探测] 节点 {node_id} 默认 {orig_label}:{eff_port} 未响应，正在尝试第 {tried} 候选协议 [{cand_label}] {target_host}:{cand_port}...",
+                )
                 alt_ok, alt_msg, alt_config = _probe_single_candidate(
                     target_host,
                     cand_proto,
@@ -2748,9 +2755,13 @@ def probe_openvpn_with_protocol_fallbacks(
                     config_text,
                 )
                 if alt_ok:
-                    cand_label = vpn_utils.format_vpn_protocol_label(cand_proto)
                     ddns_note = f", DDNS追回IP:{target_host}" if target_host != eff_host else ""
                     rescue_msg = f"{alt_msg} [多协议回退成功: {orig_label}:{eff_port} -> {cand_label}:{cand_port}{ddns_note}]"
+                    log_to_json(
+                        "INFO",
+                        "VPN",
+                        f"[多协议探测] 节点 {node_id} 回退成功: {orig_label}:{eff_port} -> {cand_label}:{cand_port}{ddns_note}",
+                    )
                     return True, rescue_msg, cand_proto, cand_port, alt_config
                 if is_systemic_probe_failure(alt_msg):
                     return False, alt_msg, eff_proto, eff_port, config_text
@@ -2815,6 +2826,13 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         if ok
         else []
     )
+    if ok:
+        proto_summary = " / ".join(supported_protos) if supported_protos else vpn_utils.format_vpn_protocol_label(eff_proto)
+        log_to_json(
+            "INFO",
+            "VPN",
+            f"[三协议检测] 节点 {node_id} ({h}:{eff_port}) 可用 · 实测支持协议: [{proto_summary}] · 延迟 {latency} ms",
+        )
 
     temp_node: dict[str, Any] = {
         "id": node_id,
@@ -2904,7 +2922,7 @@ def test_multiple_nodes(
                 dev=dev_name,
                 primary_timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
                 fallback_timeout=OPENVPN_FALLBACK_TIMEOUT_SECONDS,
-                max_fallbacks=4,
+                max_fallbacks=5,
                 cancel_event=cancel_event,
                 host_name=host_name,
             )
@@ -2930,6 +2948,13 @@ def test_multiple_nodes(
             if ok
             else []
         )
+        if ok:
+            proto_summary = " / ".join(supported_protos) if supported_protos else vpn_utils.format_vpn_protocol_label(eff_proto)
+            log_to_json(
+                "INFO",
+                "VPN",
+                f"[三协议检测] 节点 {node_id} ({h}:{eff_port}) 可用 · 实测支持协议: [{proto_summary}] · 延迟 {latency} ms",
+            )
         temp_node: dict[str, Any] = {
             "id": node_id,
             "ip": n_info.get("ip") or h,
