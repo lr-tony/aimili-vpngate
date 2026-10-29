@@ -5353,6 +5353,7 @@ table.nodes{width:100%;min-width:1120px;border-collapse:separate;border-spacing:
       </div>
       <div class="hero-meta">
         <div class="meta"><span class="meta-k">延迟</span><span class="meta-v mono lat-good" id="hLat">-</span></div>
+        <div class="meta"><span class="meta-k">连接人数</span><span class="meta-v mono" id="hSessions">-</span></div>
         <div class="meta"><span class="meta-k">服务商</span><span class="meta-v" id="hIsp">-</span></div>
         <div class="meta"><span class="meta-k">物理位置</span><span class="meta-v mono" id="hAsn">-</span></div>
         <div class="meta"><span class="meta-k">类型</span><span class="tag" id="hType">-</span></div>
@@ -5482,6 +5483,9 @@ table.nodes{width:100%;min-width:1120px;border-collapse:separate;border-spacing:
           <div class="menu-sep"></div>
           <button class="dd-opt" data-value="latency_asc" type="button">延迟 · 低 → 高</button>
           <button class="dd-opt" data-value="latency_desc" type="button">延迟 · 高 → 低</button>
+          <div class="menu-sep"></div>
+          <button class="dd-opt" data-value="sessions_asc" type="button">连接人数 · 少 → 多</button>
+          <button class="dd-opt" data-value="sessions_desc" type="button">连接人数 · 多 → 少</button>
         </div>
       </div>
 
@@ -5562,6 +5566,7 @@ table.nodes{width:100%;min-width:1120px;border-collapse:separate;border-spacing:
             <th>状态</th>
             <th>节点地址</th>
             <th style="width: 125px; cursor:pointer; user-select:none;" id="thSortLat" title="点击按延迟排序">延迟</th>
+            <th style="width: 105px; cursor:pointer; user-select:none;" id="thSortSessions" title="点击按在线连接人数排序">连接人数</th>
             <th>所在地区</th>
             <th>服务商</th>
             <th style="cursor:pointer; user-select:none;" id="thSortPurity" title="点击按纯净度排序">类型 · 质量</th>
@@ -6316,6 +6321,11 @@ function renderHeroAndStatus() {
       lEl.textContent = lat ? `${lat} ms` : "-";
       lEl.className = "meta-v mono " + latClass(lat);
     }
+    if ($("hSessions")) {
+      const sess = Number(activeNode.sessions) || 0;
+      $("hSessions").textContent = sess > 0 ? `${sess} 人` : (activeNode.in_latest_feed === false ? "历史保活" : "0 人");
+      $("hSessions").style.color = sess > 80 ? "var(--red)" : (sess > 30 ? "var(--amber)" : "var(--green)");
+    }
     if ($("hIsp")) $("hIsp").textContent = activeNode.owner || activeNode.as_name || "-";
     if ($("hAsn")) $("hAsn").textContent = activeNode.location || cName || "-";
     if ($("hType")) $("hType").textContent = translateIpType(activeNode.ip_type);
@@ -6356,6 +6366,7 @@ function renderHeroAndStatus() {
     if ($("hLoc")) $("hLoc").textContent = "当前未连接 VPN 节点";
     if ($("hAddr")) $("hAddr").textContent = "-";
     if ($("hLat")) { $("hLat").textContent = "-"; $("hLat").className = "meta-v mono"; }
+    if ($("hSessions")) { $("hSessions").textContent = "-"; $("hSessions").style.color = ""; }
     if ($("hIsp")) $("hIsp").textContent = "-";
     if ($("hAsn")) $("hAsn").textContent = "-";
     if ($("hType")) $("hType").textContent = "待连接";
@@ -6486,6 +6497,19 @@ function latCellHtml(n) {
   return `<div class="lat lat-off"><span class="mono">— 待测</span></div><div class="sub">点击 ⚡ 实测</div>`;
 }
 
+function sessionsCellHtml(n) {
+  const sess = Number(n.sessions) || 0;
+  const speedBps = Number(n.speed) || 0;
+  const speedMbps = speedBps > 0 ? (speedBps / 1000000).toFixed(speedBps >= 100000000 ? 0 : 1) : null;
+  if (sess <= 0 && n.in_latest_feed === false) {
+    return `<div class="lat lat-off"><span class="mono">— 保活</span></div><div class="sub">本地快照恢复</div>`;
+  }
+  const color = sess <= 25 ? 'var(--green)' : (sess <= 80 ? 'var(--amber)' : 'var(--red)');
+  const loadLabel = sess <= 25 ? '空闲' : (sess <= 80 ? '适中' : '拥挤');
+  const subText = speedMbps ? `${loadLabel} · ${speedMbps} Mbps` : `${loadLabel} · 在线会话`;
+  return `<div class="lat" style="color:${color}"><span class="dot-s" style="--c:${color};margin-right:4px"></span><span class="mono">${sess} 人</span></div><div class="sub">${subText}</div>`;
+}
+
 function qualityPillsHtml(n) {
   const pills = [];
   const isCleanBusy = cleanIpTestingIds.has(n.id);
@@ -6566,6 +6590,12 @@ function getFilteredNodes() {
         if (la !== lb) return filters.sort === "latency_asc" ? (la - lb) : (lb - la);
         return (getNodeEffectivePurity(b) ?? -1) - (getNodeEffectivePurity(a) ?? -1);
       }
+      if (filters.sort === "sessions_asc" || filters.sort === "sessions_desc") {
+        const sa = Number(a.sessions) || 0;
+        const sb = Number(b.sessions) || 0;
+        if (sa !== sb) return filters.sort === "sessions_asc" ? (sa - sb) : (sb - sa);
+        return (getNodeEffectiveLatency(a) ?? 999999) - (getNodeEffectiveLatency(b) ?? 999999);
+      }
       return 0;
     });
   }
@@ -6603,7 +6633,7 @@ function render() {
 
   const tbody = $("tbody");
   if (currentPageNodes.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="8"><div class="empty-box">${icon('filter')}<b>没有符合条件的节点</b><span>试试放宽筛选条件或点击右上角「同步目录」</span><button class="btn btn-sm" id="resetFiltersBtn" type="button" style="margin-top:6px">重置筛选</button></div><!-- colspan="7" --></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9"><div class="empty-box">${icon('filter')}<b>没有符合条件的节点</b><span>试试放宽筛选条件或点击右上角「同步目录」</span><button class="btn btn-sm" id="resetFiltersBtn" type="button" style="margin-top:6px">重置筛选</button></div><!-- colspan="7" --></td></tr>`;
   } else {
     tbody.innerHTML = currentPageNodes.map(n => {
       const isAct = Boolean(activeNode && n.id === activeNode.id);
@@ -6636,6 +6666,7 @@ function render() {
           <div class="sub mono" title="${esc(n.probe_message || '')}">${esc(protoStr)}${isProtoRescued ? ' ⚡自适应' : ''}${reg ? ' · ' + esc(reg) : ''}</div>
         </td>
         <td>${latCellHtml(n)}</td>
+        <td>${sessionsCellHtml(n)}</td>
         <td><div class="loc"><span class="flag">${esc(flag)}</span><span>${esc(cName)}</span><span class="loc-r">${esc(reg)}</span></div></td>
         <td><div class="isp" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="${esc(n.owner || n.as_name || '-')}">${esc(n.owner || n.as_name || '-')}</div><div class="sub">${nativeSub}</div></td>
         <td>
@@ -7645,7 +7676,16 @@ if ($("thSortLat")) {
     render();
   });
 }
-if ($("thSortPurity")) {
+  if ($("thSortSessions")) {
+    $("thSortSessions").addEventListener("click", () => {
+      filters.sort = filters.sort === "sessions_asc" ? "sessions_desc" : "sessions_asc";
+      const lbl = $("sortDDLabel");
+      if (lbl) lbl.textContent = filters.sort === "sessions_asc" ? "连接人数 · 少 → 多" : "连接人数 · 多 → 少";
+      currentPage = 1;
+      renderTable();
+    });
+  }
+  if ($("thSortPurity")) {
   $("thSortPurity").addEventListener('click', () => {
     filters.sort = filters.sort === 'purity_desc' ? 'purity_asc' : 'purity_desc';
     currentPage = 1;
