@@ -221,6 +221,113 @@ def parse_remote(config_text: str, fallback_ip: str = "") -> tuple[str, int, str
                 proto = parts[3].lower()
     return remote_host, remote_port, proto
 
+def normalize_openvpn_proto(proto: Any) -> str:
+    raw = str(proto or "").strip().lower()
+    if raw.startswith("tcp"):
+        return "tcp"
+    if raw.startswith("udp"):
+        return "udp"
+    return "udp"
+
+def rewrite_openvpn_endpoint(config_text: str, remote_host: str, port: int, proto: str) -> str:
+    """Rewrite an OpenVPN configuration's proto and remote directives to target (remote_host, port, proto)."""
+    if not config_text or not remote_host or int(port or 0) <= 0:
+        return config_text
+    proto_norm = normalize_openvpn_proto(proto)
+    port_num = int(port)
+    out_lines: list[str] = []
+    proto_written = False
+    remote_written = False
+    in_inline_block = False
+
+    for raw_line in config_text.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("<") and stripped.endswith(">"):
+            tag = stripped[1:-1].strip().lower()
+            if tag.startswith("/"):
+                in_inline_block = False
+            else:
+                in_inline_block = True
+            out_lines.append(raw_line)
+            continue
+        if in_inline_block or not stripped or stripped.startswith(("#", ";")):
+            out_lines.append(raw_line)
+            continue
+
+        parts = stripped.split()
+        directive = parts[0].lstrip("-").lower()
+        if directive == "proto":
+            if not proto_written:
+                out_lines.append(f"proto {proto_norm}")
+                proto_written = True
+            continue
+        if directive == "remote":
+            if not remote_written:
+                out_lines.append(f"remote {remote_host} {port_num}")
+                remote_written = True
+            continue
+        if directive == "explicit-exit-notify" and proto_norm == "tcp":
+            continue
+        out_lines.append(raw_line)
+
+    header_inserts: list[str] = []
+    if not proto_written:
+        header_inserts.append(f"proto {proto_norm}")
+    if not remote_written:
+        header_inserts.append(f"remote {remote_host} {port_num}")
+    if header_inserts:
+        out_lines = header_inserts + out_lines
+    return "\n".join(out_lines) + "\n"
+
+def generate_openvpn_fallback_endpoints(
+    remote_host: str,
+    primary_port: int,
+    primary_proto: str,
+) -> list[tuple[str, int]]:
+    """
+    Generate ordered alternative (proto, port) pairs for a VPNGate / SoftEther OpenVPN server.
+    SoftEther VPN Server shares its TCP listener (443, 995, 1698, 5555, or the node's custom port)
+    with OpenVPN-over-TCP, and also commonly listens on UDP 1194 / 1195 or the same port number.
+    """
+    if not remote_host:
+        return []
+    p_proto = normalize_openvpn_proto(primary_proto)
+    p_port = int(primary_port or 0)
+    seen: set[tuple[str, int]] = set()
+    if p_port > 0:
+        seen.add((p_proto, p_port))
+
+    candidates: list[tuple[str, int]] = []
+
+    def add_candidate(proto: str, port: int) -> None:
+        if port <= 0 or port > 65535:
+            return
+        key = (normalize_openvpn_proto(proto), int(port))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(key)
+
+    if p_proto == "udp":
+        # UDP failed -> try TCP on the same port, then standard SoftEther TCP ports, then common UDP ports
+        if p_port > 0:
+            add_candidate("tcp", p_port)
+        for tcp_port in (443, 995, 1194, 1698, 5555):
+            add_candidate("tcp", tcp_port)
+        for udp_port in (1194, 1195):
+            add_candidate("udp", udp_port)
+    else:
+        # TCP failed -> try UDP on the same port (if not standard HTTPS-only), then UDP 1194/1195, then other TCP ports
+        if p_port > 0 and p_port not in (80, 443):
+            add_candidate("udp", p_port)
+        for udp_port in (1194, 1195):
+            add_candidate("udp", udp_port)
+        for tcp_port in (443, 995, 1194, 1698, 5555):
+            add_candidate("tcp", tcp_port)
+        if p_port in (80, 443):
+            add_candidate("udp", p_port)
+
+    return candidates
+
 def _detect_physical_interface() -> str | None:
     try:
         res = subprocess.run(["ip", "route"], capture_output=True, text=True, timeout=2)
@@ -259,14 +366,16 @@ def get_physical_interface() -> str | None:
         physical_interface_cache = (detected, now)
         return detected
 
-def tcp_latency_ms(host: str, port: int, dev: str | None = None) -> int:
+def tcp_latency_ms(host: str, port: int, dev: str | None = None, timeout: float = 5.0) -> int:
+    if not host or _safe_int(port, 0) <= 0:
+        return 0
     started = time.time()
     # Auto-detect address family based on host address
     af = socket.AF_INET6 if ":" in host else socket.AF_INET
     s = None
     try:
         s = socket.socket(af, socket.SOCK_STREAM)
-        s.settimeout(5)
+        s.settimeout(timeout)
         if dev:
             try:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode("utf-8"))
@@ -324,10 +433,16 @@ def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
     except Exception:
         pass
 
-    # 3. Try TCP latency check
-    tcp_val = tcp_latency_ms(host, port, dev)
-    if tcp_val > 0:
-        return tcp_val
+    # 3. Try TCP latency check on primary port, then common SoftEther TCP ports (443, 995, 5555)
+    probe_ports: list[int] = []
+    for candidate_port in (port, 443, 995, 5555):
+        p_int = _safe_int(candidate_port, 0)
+        if 1 <= p_int <= 65535 and p_int not in probe_ports:
+            probe_ports.append(p_int)
+    for idx_port, candidate_port in enumerate(probe_ports):
+        tcp_val = tcp_latency_ms(host, candidate_port, dev, timeout=3.0 if idx_port == 0 else 1.5)
+        if tcp_val > 0:
+            return tcp_val
 
     # 4. Fallback
     if fallback_ping > 0:

@@ -116,7 +116,10 @@ TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 API_FETCH_TIMEOUT_SECONDS = env_int("API_FETCH_TIMEOUT_SECONDS", 10, 1, 60)
 API_SOURCE_DEADLINE_SECONDS = env_int("API_SOURCE_DEADLINE_SECONDS", 6, 2, 30)
-OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
+OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 42, 1)
+OPENVPN_PROBE_TIMEOUT_SECONDS = env_int("OPENVPN_PROBE_TIMEOUT_SECONDS", 18, 5, 60)
+OPENVPN_FALLBACK_TIMEOUT_SECONDS = env_int("OPENVPN_FALLBACK_TIMEOUT_SECONDS", 14, 5, 45)
+OPENVPN_PROTO_FALLBACK_ENABLED = os.environ.get("OPENVPN_PROTO_FALLBACK_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 NODE_PROBE_WORKERS = env_int("NODE_PROBE_WORKERS", 5, 1, 20)
@@ -1511,10 +1514,15 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
             "ifconfig-ipv6",
             "--route-delay",
             "2",
-            "--connect-retry-max",
+            "--connect-retry",
             "1",
+            "2",
+            "--connect-retry-max",
+            "2",
             "--connect-timeout",
-            "15",
+            "20",
+            "--hand-window",
+            "25",
             "--auth-user-pass",
             str(AUTH_FILE),
             "--auth-nocache",
@@ -2238,75 +2246,6 @@ def test_config_path(node_id: str) -> Path:
     safe_id = safe_name(node_id)
     return CONFIG_DIR / f".test_{safe_id}_{uuid.uuid4().hex}.ovpn"
 
-def test_node_by_id(node_id: str) -> dict[str, Any]:
-    with lock:
-        nodes = read_nodes()
-        node = next((item for item in nodes if item.get("id") == node_id), None)
-        if not node:
-            raise ValueError(f"Node not found: {node_id}")
-        config_text = node.get("config_text") or ""
-        h = str(node.get("remote_host") or node.get("ip"))
-        p = parse_int(node.get("remote_port"))
-        fallback_ping = parse_int(node.get("ping"))
-
-    temp_path = test_config_path(node_id)
-    try:
-        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-        temp_path.write_text(config_text, encoding="utf-8")
-    except Exception as e:
-        raise RuntimeError(f"Failed to write temp config file: {e}")
-
-    latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
-    
-    idx = None
-    try:
-        idx = get_free_test_index()
-        ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
-    finally:
-        if idx is not None:
-            release_test_index(idx)
-        try:
-            if temp_path.exists():
-                temp_path.unlink()
-        except Exception:
-            pass
-
-    temp_node = {
-        "id": node_id,
-        "ip": h,
-        "remote_host": h,
-        "remote_port": p,
-        "owner": "",
-        "asn": "",
-        "as_name": "",
-        "location": "",
-        "ip_type": "",
-        "quality": "",
-    }
-    if ok:
-        vpn_utils.enrich_ip_info([temp_node])
-
-    with lock:
-        nodes = read_nodes()
-        node = next((item for item in nodes if item.get("id") == node_id), None)
-        if node:
-            node["latency_ms"] = latency
-            node["probe_status"] = "available" if ok else "unavailable"
-            node["probe_message"] = message
-            node["probed_at"] = time.time()
-            if ok:
-                for field in IP_ENRICHMENT_FIELDS:
-                    value = temp_node.get(field)
-                    if value not in (None, ""):
-                        node[field] = value
-            
-            sorted_nodes = sort_all_nodes(nodes)
-            write_json(NODES_FILE, sorted_nodes)
-            res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
-            return res
-        else:
-            return {}
-
 def is_systemic_probe_failure(message: Any) -> bool:
     normalized = str(message or "").lower()
     return any(
@@ -2320,6 +2259,201 @@ def is_systemic_probe_failure(message: Any) -> bool:
             "cannot allocate tun",
         )
     )
+
+def probe_openvpn_with_protocol_fallbacks(
+    node_id: str,
+    config_text: str,
+    remote_host: str,
+    primary_port: int,
+    primary_proto: str,
+    dev: str,
+    primary_timeout: int | None = None,
+    fallback_timeout: int | None = None,
+    max_fallbacks: int = 2,
+    cancel_event: threading.Event | None = None,
+    track_pending: bool = False,
+) -> tuple[bool, str, str, int, str]:
+    """
+    Probe a node using its primary OpenVPN (proto, port) first, and if that fails with a
+    non-systemic / non-auth error, automatically try alternative SoftEther OpenVPN protocols
+    and ports (e.g., UDP <-> TCP on same port, TCP 443, TCP 995, UDP 1194, TCP 5555).
+    Returns (ok, message, effective_proto, effective_port, effective_config_text).
+    """
+    p_timeout = primary_timeout if primary_timeout is not None else OPENVPN_PROBE_TIMEOUT_SECONDS
+    f_timeout = fallback_timeout if fallback_timeout is not None else OPENVPN_FALLBACK_TIMEOUT_SECONDS
+    parsed_host, parsed_port, parsed_proto = vpn_utils.parse_remote(config_text, remote_host)
+    eff_host = remote_host or parsed_host
+    eff_port = int(primary_port or parsed_port or 0)
+    raw_proto = primary_proto if primary_proto and primary_proto != "unknown" else parsed_proto
+    eff_proto = vpn_utils.normalize_openvpn_proto(raw_proto)
+    if eff_port <= 0:
+        eff_port = 443 if eff_proto == "tcp" else 1194
+
+    temp_path = test_config_path(node_id)
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        temp_path.write_text(config_text, encoding="utf-8")
+    except Exception as exc:
+        return False, f"Failed to write temp config file: {exc}", eff_proto, eff_port, config_text
+
+    try:
+        ok, message, _ = run_openvpn_until_ready(
+            str(temp_path),
+            keep_alive=False,
+            route_nopull=True,
+            timeout=p_timeout,
+            dev=dev,
+            cancel_event=cancel_event,
+            track_pending=track_pending,
+        )
+        if ok:
+            return True, message, eff_proto, eff_port, config_text
+
+        msg_lower = str(message or "").lower()
+        if (
+            not OPENVPN_PROTO_FALLBACK_ENABLED
+            or max_fallbacks <= 0
+            or not eff_host
+            or (cancel_event is not None and cancel_event.is_set())
+            or is_systemic_probe_failure(message)
+            or "auth_failed" in msg_lower
+            or "err_ovpn_auth_failed" in msg_lower
+            or "连接操作已取消" in msg_lower
+        ):
+            return False, message, eff_proto, eff_port, config_text
+
+        candidates = vpn_utils.generate_openvpn_fallback_endpoints(eff_host, eff_port, eff_proto)
+        if not candidates:
+            return False, message, eff_proto, eff_port, config_text
+
+        phys_dev = vpn_utils.get_physical_interface()
+        tried = 0
+        for cand_proto, cand_port in candidates:
+            if tried >= max_fallbacks:
+                break
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            if cand_proto == "tcp":
+                # Fast TCP reachability pre-check (1.8s) to avoid wasting OpenVPN handshake time on closed TCP ports
+                if vpn_utils.tcp_latency_ms(eff_host, cand_port, phys_dev, timeout=1.8) <= 0:
+                    continue
+
+            alt_config = vpn_utils.rewrite_openvpn_endpoint(config_text, eff_host, cand_port, cand_proto)
+            try:
+                temp_path.write_text(alt_config, encoding="utf-8")
+            except Exception:
+                continue
+
+            tried += 1
+            alt_ok, alt_msg, _ = run_openvpn_until_ready(
+                str(temp_path),
+                keep_alive=False,
+                route_nopull=True,
+                timeout=f_timeout,
+                dev=dev,
+                cancel_event=cancel_event,
+                track_pending=track_pending,
+            )
+            if alt_ok:
+                rescue_msg = f"{alt_msg} [多协议回退成功: {eff_proto.upper()}:{eff_port} -> {cand_proto.upper()}:{cand_port}]"
+                return True, rescue_msg, cand_proto, cand_port, alt_config
+            if is_systemic_probe_failure(alt_msg):
+                return False, alt_msg, eff_proto, eff_port, config_text
+
+        return False, message, eff_proto, eff_port, config_text
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+def test_node_by_id(node_id: str) -> dict[str, Any]:
+    with lock:
+        nodes = read_nodes()
+        node = next((item for item in nodes if item.get("id") == node_id), None)
+        if not node:
+            raise ValueError(f"Node not found: {node_id}")
+        config_text = node.get("config_text") or ""
+        h = str(node.get("remote_host") or node.get("ip"))
+        p = parse_int(node.get("remote_port"))
+        proto = str(node.get("proto") or "")
+        cfg_file_str = str(node.get("config_file") or "")
+        fallback_ping = parse_int(node.get("ping"))
+
+    latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+
+    idx = None
+    try:
+        idx = get_free_test_index()
+        ok, message, eff_proto, eff_port, eff_config = probe_openvpn_with_protocol_fallbacks(
+            node_id=node_id,
+            config_text=config_text,
+            remote_host=h,
+            primary_port=p,
+            primary_proto=proto,
+            dev=f"tun{idx}",
+            primary_timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
+            fallback_timeout=OPENVPN_FALLBACK_TIMEOUT_SECONDS,
+            max_fallbacks=4,
+        )
+    finally:
+        if idx is not None:
+            release_test_index(idx)
+
+    if ok and eff_port != p:
+        re_lat = vpn_utils.ping_latency_ms(h, eff_port, latency or fallback_ping)
+        if re_lat > 0:
+            latency = re_lat
+
+    temp_node: dict[str, Any] = {
+        "id": node_id,
+        "ip": h,
+        "remote_host": h,
+        "remote_port": eff_port if ok else p,
+        "proto": eff_proto if ok else (proto or "udp"),
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+    }
+    if ok:
+        vpn_utils.enrich_ip_info([temp_node])
+        if eff_config and eff_config != config_text and cfg_file_str:
+            try:
+                Path(cfg_file_str).write_text(eff_config, encoding="utf-8")
+            except Exception:
+                pass
+
+    with lock:
+        nodes = read_nodes()
+        node = next((item for item in nodes if item.get("id") == node_id), None)
+        if node:
+            node["latency_ms"] = latency
+            node["probe_status"] = "available" if ok else "unavailable"
+            node["probe_message"] = message
+            node["probed_at"] = time.time()
+            if ok:
+                node["proto"] = eff_proto
+                node["remote_port"] = eff_port
+                node["config_text"] = eff_config
+                for field in IP_ENRICHMENT_FIELDS:
+                    value = temp_node.get(field)
+                    if value not in (None, ""):
+                        node[field] = value
+
+            sorted_nodes = sort_all_nodes(nodes)
+            write_json(NODES_FILE, sorted_nodes)
+            try:
+                sync_favorite_snapshots_with_nodes(nodes=sorted_nodes)
+            except Exception:
+                pass
+            res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
+            return res
+        else:
+            return {}
 
 def test_multiple_nodes(
     node_ids: list[str],
@@ -2339,46 +2473,50 @@ def test_multiple_nodes(
         config_text = n_info.get("config_text") or ""
         h = str(n_info.get("remote_host") or n_info.get("ip"))
         p = parse_int(n_info.get("remote_port"))
+        proto = str(n_info.get("proto") or "")
+        cfg_file_str = str(n_info.get("config_file") or "")
         fallback_ping = parse_int(n_info.get("ping"))
         
-        temp_path = test_config_path(node_id)
-        try:
-            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            temp_path.write_text(config_text, encoding="utf-8")
-        except Exception as e:
-            return {
-                "id": node_id,
-                "latency_ms": 0,
-                "probe_status": "unavailable",
-                "probe_message": f"Failed to write configuration: {e}",
-                "probed_at": time.time(),
-            }
-            
         latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
         tun_idx = None
         try:
             tun_idx = get_free_test_index()
             dev_name = f"tun{tun_idx}"
-            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name, cancel_event=cancel_event)
+            ok, message, eff_proto, eff_port, eff_config = probe_openvpn_with_protocol_fallbacks(
+                node_id=node_id,
+                config_text=config_text,
+                remote_host=h,
+                primary_port=p,
+                primary_proto=proto,
+                dev=dev_name,
+                primary_timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
+                fallback_timeout=OPENVPN_FALLBACK_TIMEOUT_SECONDS,
+                max_fallbacks=2,
+                cancel_event=cancel_event,
+            )
         finally:
             if tun_idx is not None:
                 release_test_index(tun_idx)
+
+        if ok and eff_config and eff_config != config_text and cfg_file_str:
             try:
-                if temp_path.exists():
-                    temp_path.unlink()
+                Path(cfg_file_str).write_text(eff_config, encoding="utf-8")
             except Exception:
                 pass
             
-        temp_node = {
+        temp_node: dict[str, Any] = {
             "id": node_id,
             "ip": n_info.get("ip") or h,
             "remote_host": h,
-            "remote_port": p,
+            "remote_port": eff_port if ok else p,
+            "proto": eff_proto if ok else (proto or "udp"),
             "latency_ms": latency,
             "probe_status": "available" if ok else "unavailable",
             "probe_message": message,
             "probed_at": time.time(),
         }
+        if ok and eff_config:
+            temp_node["config_text"] = eff_config
         return temp_node
 
     updated_nodes_map: dict[str, dict[str, Any]] = {}
@@ -2402,7 +2540,7 @@ def test_multiple_nodes(
                 for current in current_nodes:
                     if current.get("id") in batch_ids and not current.get("active"):
                         current["probe_status"] = "testing"
-                        current["probe_message"] = "正在检测节点连通性..."
+                        current["probe_message"] = "正在检测节点连通性 (支持 UDP/TCP 多协议回退)..."
                         current["probed_at"] = now
                 write_json(NODES_FILE, sort_all_nodes(current_nodes))
 
@@ -2625,9 +2763,13 @@ def connect_node(node_id: str) -> str:
 
         set_state(active_node_latency="写入配置", last_check_message="正在写入 OpenVPN 节点配置文件...")
         config_path = Path(node["config_file"])
+        config_text = str(node.get("config_text") or "")
+        remote_host = str(node.get("remote_host") or node.get("ip") or "")
+        eff_port = parse_int(node.get("remote_port"))
+        eff_proto = vpn_utils.normalize_openvpn_proto(node.get("proto"))
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            config_path.write_text(node.get("config_text") or "", encoding="utf-8")
+            config_path.write_text(config_text, encoding="utf-8")
         except Exception as e:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
@@ -2639,16 +2781,20 @@ def connect_node(node_id: str) -> str:
             and time.time() - probed_at > SWITCH_PREFLIGHT_MAX_AGE_SECONDS
         )
         if should_preflight:
-            set_state(active_node_latency="切换预检", last_check_message="正在保持当前连接并预检目标节点...")
+            set_state(active_node_latency="切换预检", last_check_message="正在保持当前连接并预检目标节点 (支持 UDP/TCP 多协议回退)...")
             test_index = None
             try:
                 test_index = get_free_test_index()
-                preflight_ok, preflight_message, _ = run_openvpn_until_ready(
-                    str(config_path),
-                    keep_alive=False,
-                    route_nopull=True,
-                    timeout=12,
+                preflight_ok, preflight_message, pf_proto, pf_port, pf_config = probe_openvpn_with_protocol_fallbacks(
+                    node_id=node_id,
+                    config_text=config_text,
+                    remote_host=remote_host,
+                    primary_port=eff_port,
+                    primary_proto=eff_proto,
                     dev=f"tun{test_index}",
+                    primary_timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
+                    fallback_timeout=OPENVPN_FALLBACK_TIMEOUT_SECONDS,
+                    max_fallbacks=3,
                     cancel_event=cancel_event,
                     track_pending=True,
                 )
@@ -2667,6 +2813,17 @@ def connect_node(node_id: str) -> str:
                         failed_node["probed_at"] = time.time()
                         write_json(NODES_FILE, sort_all_nodes(current_nodes))
                 raise RuntimeError(f"目标节点预检失败，已保留当前连接: {preflight_message}")
+            if pf_config and pf_config != config_text:
+                config_text = pf_config
+                eff_proto = pf_proto
+                eff_port = pf_port
+                node["config_text"] = config_text
+                node["proto"] = eff_proto
+                node["remote_port"] = eff_port
+                try:
+                    config_path.write_text(config_text, encoding="utf-8")
+                except Exception:
+                    pass
 
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
@@ -2685,6 +2842,60 @@ def connect_node(node_id: str) -> str:
         if not connection_attempt_is_current(token, cancel_event):
             stop_process(process)
             raise ConnectionCancelled("连接操作已取消")
+
+        if (not ok or process is None) and OPENVPN_PROTO_FALLBACK_ENABLED and remote_host:
+            msg_lower = str(message or "").lower()
+            if (
+                not is_systemic_probe_failure(message)
+                and "auth_failed" not in msg_lower
+                and "err_ovpn_auth_failed" not in msg_lower
+                and "连接操作已取消" not in msg_lower
+            ):
+                fallback_candidates = vpn_utils.generate_openvpn_fallback_endpoints(remote_host, eff_port, eff_proto)
+                phys_dev = vpn_utils.get_physical_interface()
+                tried_fb = 0
+                for cand_proto, cand_port in fallback_candidates:
+                    if tried_fb >= 3 or not connection_attempt_is_current(token, cancel_event):
+                        break
+                    if cand_proto == "tcp":
+                        if vpn_utils.tcp_latency_ms(remote_host, cand_port, phys_dev, timeout=1.8) <= 0:
+                            continue
+                    alt_config = vpn_utils.rewrite_openvpn_endpoint(config_text, remote_host, cand_port, cand_proto)
+                    try:
+                        config_path.write_text(alt_config, encoding="utf-8")
+                    except Exception:
+                        continue
+                    tried_fb += 1
+                    set_state(
+                        active_node_latency=f"尝试 {cand_proto.upper()}:{cand_port}",
+                        last_check_message=f"默认协议未响应，正在尝试备用协议 {cand_proto.upper()}:{cand_port}...",
+                    )
+                    fb_ok, fb_msg, fb_proc = run_openvpn_until_ready(
+                        str(config_path),
+                        keep_alive=True,
+                        route_nopull=True,
+                        timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
+                        cancel_event=cancel_event,
+                        track_pending=True,
+                    )
+                    if not connection_attempt_is_current(token, cancel_event):
+                        stop_process(fb_proc)
+                        raise ConnectionCancelled("连接操作已取消")
+                    if fb_ok and fb_proc is not None:
+                        ok = True
+                        message = f"{fb_msg} [多协议回退成功: {eff_proto.upper()}:{eff_port} -> {cand_proto.upper()}:{cand_port}]"
+                        process = fb_proc
+                        config_text = alt_config
+                        eff_proto = cand_proto
+                        eff_port = cand_port
+                        node["config_text"] = config_text
+                        node["proto"] = eff_proto
+                        node["remote_port"] = eff_port
+                        break
+                    if is_systemic_probe_failure(fb_msg):
+                        message = fb_msg
+                        break
+
         if not ok or process is None:
             try:
                 if config_path.exists():
@@ -2719,7 +2930,7 @@ def connect_node(node_id: str) -> str:
         set_state(active_node_latency="测试延迟", last_check_message="正在直连测试代理出口延迟与可用性...")
         try:
             ip = node.get("ip") or node.get("remote_host")
-            port = parse_int(node.get("remote_port"))
+            port = eff_port or parse_int(node.get("remote_port"))
             fallback = parse_int(node.get("ping"))
             latency = vpn_utils.ping_latency_ms(ip, port, fallback)
             if latency > 0:
@@ -2751,9 +2962,17 @@ def connect_node(node_id: str) -> str:
                 if item["active"]:
                     item["probe_status"] = "available"
                     item["probed_at"] = time.time()
+                    item["proto"] = eff_proto
+                    item["remote_port"] = eff_port
+                    item["config_text"] = config_text
                     _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
-                    item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
-            write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                    item["probe_message"] = f"Active node ({eff_proto.upper()}:{eff_port}). HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
+            sorted_current = sort_all_nodes(current_nodes)
+            write_json(NODES_FILE, sorted_current)
+            try:
+                sync_favorite_snapshots_with_nodes(nodes=sorted_current)
+            except Exception:
+                pass
             write_json(auth_file, latest_ui_cfg)
             consecutive_proxy_failures = 0
             last_proxy_failure_node_id = node_id
@@ -2761,7 +2980,7 @@ def connect_node(node_id: str) -> str:
                 active_openvpn_node_id=node_id,
                 is_connecting=False,
                 pending_node_id="",
-                last_check_message=f"Connected {node_id}",
+                last_check_message=f"Connected {node_id} ({eff_proto.upper()}:{eff_port})",
                 active_node_latency=latency_str,
                 proxy_ok=True,
                 tunnel_ready=True,
@@ -2770,7 +2989,7 @@ def connect_node(node_id: str) -> str:
                 proxy_latency_ms=res["latency_ms"],
                 proxy_error="",
             )
-        log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
+        log_to_json("INFO", "VPN", f"节点 {node_id} ({eff_proto.upper()}:{eff_port}) 连接成功，出口网卡 tun0 已启用")
         cancel_background_refill()
         return f"Connected {node_id}"
     except ConnectionCancelled:
@@ -5944,20 +6163,21 @@ function render() {
       const reg = getNodeRegion(n) || (n.location && n.location !== cName ? n.location : "");
       const keepBadge = (isFav && n.in_latest_feed === false) ? '<span class="keep" title="该收藏节点已由本地快照防丢保活">★ 保活</span>' : '';
       const protoStr = String(n.proto || 'udp').toUpperCase();
+      const isProtoRescued = String(n.probe_message || '').includes('多协议回退成功');
       const tKey = n.ip_type === 'hosting' ? 'core' : (n.ip_type === 'mobile' ? 'direct' : 'edge');
       const nativeSub = (n.cleanip_is_native || n.intel_is_native) ? '原生住宅段' : (n.ip_type === 'hosting' ? '数据中心段' : 'ISP 宽带接入');
 
-      const testBtn = `<button class="act" data-a="test" data-tip="测速" type="button" ${isTest ? 'disabled' : ''}>${icon('bolt')}</button>`;
+      const testBtn = `<button class="act" data-a="test" data-tip="测速 (自动尝试 UDP/TCP 多协议)" type="button" ${isTest ? 'disabled' : ''}>${icon('bolt')}</button>`;
       const swBtn = isAct
         ? `<button class="btn btn-sm btn-using" type="button" disabled>${icon('check')}使用中</button>`
-        : `<button class="btn btn-sm btn-switch" data-a="switch" type="button" ${(isOff || isTest || state.is_connecting) ? 'disabled' : ''}>${icon('switch')}${isPend ? '切换中' : '切换'}</button>`;
+        : `<button class="btn btn-sm btn-switch" data-a="switch" type="button" title="${isOff ? '强制尝试连接 (自动切换 UDP/TCP 多协议端口)' : '切换到此节点'}" ${(isTest || state.is_connecting) ? 'disabled' : ''}>${icon('switch')}${isPend ? '切换中' : '切换'}</button>`;
 
       return `<tr class="${cls}" data-id="${esc(n.id)}">
         <td class="c-cb"><input type="checkbox" class="cb row-cb" value="${esc(n.id)}" ${isSel ? 'checked' : ''} aria-label="选择 ${esc(n.ip || n.remote_host)}"></td>
         <td>${statusBadgeHtml(n, isAct, isPend)}</td>
         <td>
           <div class="addr"><span class="ip mono">${esc(n.ip || n.remote_host)}</span><span class="port mono">:${esc(n.remote_port || '')}</span>${keepBadge}</div>
-          <div class="sub mono">${esc(protoStr)}${reg ? ' · ' + esc(reg) : ''}</div>
+          <div class="sub mono" title="${esc(n.probe_message || '')}">${esc(protoStr)}${isProtoRescued ? ' ⚡自适应' : ''}${reg ? ' · ' + esc(reg) : ''}</div>
         </td>
         <td>${latCellHtml(n)}</td>
         <td><div class="loc"><span class="flag">${esc(flag)}</span><span>${esc(cName)}</span><span class="loc-r">${esc(reg)}</span></div></td>

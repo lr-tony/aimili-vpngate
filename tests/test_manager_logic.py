@@ -1223,6 +1223,83 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("CleanIP.io", parsed_html["cleanip_report"])
         self.assertIn("94/100 (A)", parsed_html["cleanip_report"])
 
+    def test_openvpn_protocol_fallback_rescues_udp_node_via_tcp(self) -> None:
+        nodes = self.write_nodes(1)
+        node = nodes[0]
+        node["proto"] = "udp"
+        node["remote_port"] = 17111
+        node["config_text"] = (
+            "client\n"
+            "dev tun\n"
+            "proto udp\n"
+            f"remote {node['ip']} 17111\n"
+            "explicit-exit-notify\n"
+            "<ca>\nCA\n</ca>\n"
+            "<cert>\nCERT\n</cert>\n"
+            "<key>\nKEY\n</key>\n"
+        )
+        manager.write_json(manager.NODES_FILE, [node])
+
+        attempted_configs: list[str] = []
+
+        def fake_openvpn(config_file, **kwargs):
+            text = Path(config_file).read_text(encoding="utf-8")
+            attempted_configs.append(text)
+            if "proto tcp" in text and f"remote {node['ip']} 443" in text:
+                return True, "OpenVPN connected in 320 ms.", None
+            return False, "[错误代码 2004] [ERR_OVPN_NODE_UNREACHABLE] 节点连接超时", None
+
+        def fake_tcp_latency(host, port, dev=None, timeout=5.0):
+            return 28 if int(port) == 443 else 0
+
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=28),
+            mock.patch.object(manager.vpn_utils, "tcp_latency_ms", side_effect=fake_tcp_latency),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+        ):
+            res = manager.test_node_by_id(node["id"])
+
+        self.assertEqual("available", res["probe_status"])
+        self.assertEqual("tcp", res["proto"])
+        self.assertEqual(443, res["remote_port"])
+        self.assertIn("多协议回退成功", res["probe_message"])
+        self.assertIn("proto tcp", res["config_text"])
+        self.assertNotIn("explicit-exit-notify", res["config_text"])
+        self.assertEqual(2, len(attempted_configs))
+
+    def test_connect_node_falls_back_to_alternative_protocol_on_timeout(self) -> None:
+        nodes = self.write_nodes(1)
+        node = nodes[0]
+        node["proto"] = "udp"
+        node["remote_port"] = 3040
+        node["probed_at"] = manager.time.time()
+        manager.write_json(manager.NODES_FILE, [node])
+        live_proc = FakeProcess()
+
+        def fake_openvpn(config_file, **kwargs):
+            text = Path(config_file).read_text(encoding="utf-8")
+            if "proto tcp" in text and f"remote {node['ip']} 3040" in text:
+                return True, "OpenVPN connected in 250 ms.", live_proc
+            return False, "OpenVPN timeout after 42s.", None
+
+        with (
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+            mock.patch.object(manager.vpn_utils, "tcp_latency_ms", return_value=22),
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=22),
+            mock.patch.object(manager, "setup_policy_routing", return_value=True),
+            mock.patch.object(manager, "check_proxy_health", return_value={"ok": True, "ip": node["ip"], "latency_ms": 25}),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            msg = manager.connect_node(node["id"])
+
+        self.assertIn("Connected", msg)
+        stored = manager.read_nodes()[0]
+        self.assertTrue(stored["active"])
+        self.assertEqual("available", stored["probe_status"])
+        self.assertEqual("tcp", stored["proto"])
+        self.assertEqual(3040, stored["remote_port"])
+
 
 class ProxyServerConcurrencyTests(unittest.TestCase):
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
