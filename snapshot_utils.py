@@ -171,3 +171,114 @@ def parse_and_validate_snapshot(text: str, max_rows: int | None = None) -> list[
 def snapshot_summary(text: str) -> dict[str, Any]:
     rows = parse_and_validate_snapshot(text)
     return {"row_count": len(rows), "byte_count": len(text.encode("utf-8"))}
+
+
+def parse_vpngate_web_html(html_text: str, max_rows: int | None = None) -> list[dict[str, Any]]:
+    """
+    Parse VPNGate official web table HTML (https://www.vpngate.net/en/) into structured records,
+    including nodes that only enable SoftEther SSL-VPN or MS-SSTP without OpenVPN config files,
+    as well as dual TCP+UDP port metadata from do_openvpn.aspx links.
+    """
+    if not html_text or "vg_table_row_" not in html_text:
+        return []
+
+    raw_rows = re.split(r"<tr[^>]*>", html_text, flags=re.IGNORECASE)
+    results: list[dict[str, Any]] = []
+
+    for row_html in raw_rows:
+        if "vg_table_row_" not in row_html:
+            continue
+        tds = re.split(r"<td[^>]*>", row_html, flags=re.IGNORECASE)[1:]
+        if len(tds) < 10:
+            continue
+
+        # Column 0: Flag + CountryLong
+        flag_m = re.search(r"flags/([A-Za-z]{2})\.png", tds[0], flags=re.IGNORECASE)
+        country_short = flag_m.group(1).upper() if flag_m else "XX"
+        country_long = re.sub(r"<[^>]+>", " ", tds[0]).strip()
+        country_long = re.sub(r"\s+", " ", country_long)
+
+        # Column 1: FQDN (vpnXXXX.opengw.net), IP, PTR
+        fqdn_m = re.search(r"([a-zA-Z0-9_-]+)\.opengw\.net", tds[1], flags=re.IGNORECASE)
+        host_name = fqdn_m.group(1) if fqdn_m else ""
+        ip_m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", tds[1])
+        ip = ip_m.group(1) if ip_m else ""
+        if not ip:
+            continue
+
+        # Column 2: Sessions
+        sess_m = re.search(r"([\d,]+)\s*sessions?", tds[2], flags=re.IGNORECASE)
+        sessions = int(sess_m.group(1).replace(",", "")) if sess_m else 0
+
+        # Column 3: Speed (Mbps) + Ping (ms)
+        speed_m = re.search(r"([\d.]+)\s*Mbps", tds[3], flags=re.IGNORECASE)
+        speed_bps = int(float(speed_m.group(1)) * 1_000_000) if speed_m else 0
+        ping_m = re.search(r"Ping:\s*<b>\s*(\d+)\s*ms", tds[3], flags=re.IGNORECASE) or re.search(
+            r"\b(\d+)\s*ms\b", tds[3], flags=re.IGNORECASE
+        )
+        ping = int(ping_m.group(1)) if ping_m else 0
+
+        # Column 4: SoftEther SSL-VPN
+        ssl_text = re.sub(r"<[^>]+>", " ", tds[4])
+        has_sslvpn = bool(re.search(r"SSL-VPN", ssl_text, flags=re.IGNORECASE))
+        ssl_tcp_m = re.search(r"TCP:\s*(\d+)", ssl_text, flags=re.IGNORECASE)
+        ssl_tcp_port = int(ssl_tcp_m.group(1)) if ssl_tcp_m else 0
+
+        # Column 5: L2TP/IPsec
+        has_l2tp = bool(re.search(r"L2TP", tds[5], flags=re.IGNORECASE))
+
+        # Column 6: OpenVPN
+        ovpn_m = re.search(r"do_openvpn\.aspx\?([^'\"\s>]+)", tds[6], flags=re.IGNORECASE)
+        has_ovpn = bool(ovpn_m)
+        ovpn_tcp_port = 0
+        ovpn_udp_port = 0
+        if ovpn_m:
+            qs = ovpn_m.group(1)
+            tm = re.search(r"(?:^|[&?])tcp=(\d+)", qs, flags=re.IGNORECASE)
+            um = re.search(r"(?:^|[&?])udp=(\d+)", qs, flags=re.IGNORECASE)
+            ovpn_tcp_port = int(tm.group(1)) if tm else 0
+            ovpn_udp_port = int(um.group(1)) if um else 0
+        else:
+            ovpn_text = re.sub(r"<[^>]+>", " ", tds[6])
+            tm = re.search(r"TCP:\s*(\d+)", ovpn_text, flags=re.IGNORECASE)
+            um = re.search(r"UDP:\s*(\d+)", ovpn_text, flags=re.IGNORECASE)
+            ovpn_tcp_port = int(tm.group(1)) if tm else 0
+            ovpn_udp_port = int(um.group(1)) if um else 0
+
+        # Column 7: MS-SSTP
+        sstp_text = re.sub(r"<[^>]+>", " ", tds[7])
+        has_sstp = bool(re.search(r"MS-SSTP|SSTP\s+Hostname", sstp_text, flags=re.IGNORECASE))
+        sstp_port_m = re.search(r"\.opengw\.net:(\d+)", sstp_text, flags=re.IGNORECASE)
+        sstp_port = int(sstp_port_m.group(1)) if sstp_port_m else (ssl_tcp_port or ovpn_tcp_port or 443)
+
+        # Column 9: Score
+        score_text = re.sub(r"[^0-9]", "", re.sub(r"<[^>]+>", "", tds[9]))
+        score = int(score_text) if score_text.isdigit() else 100000
+
+        if not (has_ovpn or has_sslvpn or has_sstp or has_l2tp):
+            continue
+
+        results.append(
+            {
+                "HostName": host_name or f"vpn-{ip.replace('.', '-')}",
+                "IP": ip,
+                "Score": str(score),
+                "Ping": str(ping),
+                "Speed": str(speed_bps),
+                "CountryLong": country_long or country_short,
+                "CountryShort": country_short,
+                "NumVpnSessions": str(sessions),
+                "has_openvpn": has_ovpn,
+                "ovpn_tcp_port": ovpn_tcp_port,
+                "ovpn_udp_port": ovpn_udp_port,
+                "has_sslvpn": has_sslvpn,
+                "ssl_tcp_port": ssl_tcp_port,
+                "has_sstp": has_sstp,
+                "sstp_port": sstp_port,
+                "has_l2tp": has_l2tp,
+            }
+        )
+        if max_rows is not None and len(results) >= max_rows:
+            break
+
+    return results

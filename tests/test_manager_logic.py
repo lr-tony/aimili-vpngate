@@ -1337,6 +1337,40 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("SSL-VPN", res["probe_message"])
         self.assertEqual("vpn379858910.opengw.net", manager.vpn_utils.build_vpngate_ddns_hostname(node["host_name"]))
 
+    def test_parse_vpngate_web_html_extracts_non_openvpn_and_dual_port_nodes(self) -> None:
+        sample_html = """
+        <table id="vg_hosts_table_id">
+        <tr>
+          <td class='vg_table_row_0'><img src='../images/flags/JP.png' /><br>Japan</td>
+          <td class='vg_table_row_0'><b><span>vpn445562347.opengw.net</span></b><br><span>118.86.75.249</span></td>
+          <td class='vg_table_row_0'><b><span>3 sessions</span></b><BR><span>15 hours</span></td>
+          <td class='vg_table_row_0'><b><span>114.60 Mbps</span></b><BR>Ping: <b>19 ms</b></td>
+          <td class='vg_table_row_0'><a href='howto_softether.aspx'><b>SSL-VPN</b></a><BR>TCP: 443<BR>UDP: Supported</td>
+          <td class='vg_table_row_0'></td>
+          <td class='vg_table_row_0'></td>
+          <td class='vg_table_row_0'><a href='howto_sstp.aspx'><b>MS-SSTP</b></a><span>SSTP Hostname : vpn445562347.opengw.net:443</span></td>
+          <td class='vg_table_row_0'><i>By owner</i></td>
+          <td class='vg_table_row_0'><b><span>672,645</span></b></td>
+        </tr>
+        </table>
+        """
+        rows = snapshot_utils.parse_vpngate_web_html(sample_html)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("118.86.75.249", rows[0]["IP"])
+        self.assertEqual("JP", rows[0]["CountryShort"])
+        self.assertEqual("vpn445562347", rows[0]["HostName"])
+        self.assertFalse(rows[0]["has_openvpn"])
+        self.assertTrue(rows[0]["has_sslvpn"])
+        self.assertTrue(rows[0]["has_sstp"])
+
+        existing = self.write_nodes(1)
+        wnode = manager.web_row_to_node(rows[0], existing_nodes=existing)
+        self.assertIsNotNone(wnode)
+        self.assertEqual("sslvpn", wnode["proto"])
+        self.assertEqual(443, wnode["remote_port"])
+        self.assertIn("SSL-VPN", wnode["supported_protocols"])
+        self.assertIn("SSTP", wnode["supported_protocols"])
+
 
 class ProxyServerConcurrencyTests(unittest.TestCase):
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:

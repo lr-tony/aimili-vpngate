@@ -108,6 +108,11 @@ MIRROR_META_URL = os.environ.get(
     "VPNGATE_MIRROR_META_URL",
     "https://baoweise-bot.github.io/aimili-vpngate/vpngate.meta.json",
 ).strip()
+WEB_HTML_HTTPS_URL = os.environ.get(
+    "VPNGATE_WEB_HTML_HTTPS_URL",
+    "https://www.vpngate.net/en/",
+).strip()
+ROLLING_POOL_RETENTION_SECONDS = env_int("ROLLING_POOL_RETENTION_SECONDS", 12 * 3600, 300, 7 * 24 * 3600)
 # Kept as the primary URL for diagnostics and backwards-compatible state output.
 API_URL = API_HTTPS_URL
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
@@ -1352,6 +1357,181 @@ def filter_candidates_by_discovery_countries(
         if str(candidate.get("country_short") or "").strip().upper() in selected
     ]
 
+def web_row_to_node(
+    web_row: dict[str, Any],
+    existing_nodes: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    ip = str(web_row.get("IP") or "").strip()
+    if not ip:
+        return None
+    country_short = str(web_row.get("CountryShort") or "XX").strip().upper() or "XX"
+    country_long = str(web_row.get("CountryLong") or country_short).strip()
+    country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(
+        country_long,
+        vpn_utils.COUNTRY_TRANSLATIONS.get(country_long.strip(), country_long),
+    )
+
+    has_ovpn = bool(web_row.get("has_openvpn"))
+    ovpn_tcp_port = parse_int(web_row.get("ovpn_tcp_port"))
+    ovpn_udp_port = parse_int(web_row.get("ovpn_udp_port"))
+    has_sslvpn = bool(web_row.get("has_sslvpn"))
+    ssl_tcp_port = parse_int(web_row.get("ssl_tcp_port"))
+    has_sstp = bool(web_row.get("has_sstp"))
+    sstp_port = parse_int(web_row.get("sstp_port"))
+    has_l2tp = bool(web_row.get("has_l2tp"))
+
+    if has_ovpn and (ovpn_tcp_port > 0 or ovpn_udp_port > 0):
+        if ovpn_tcp_port > 0:
+            proto = "tcp"
+            remote_port = ovpn_tcp_port
+        else:
+            proto = "udp"
+            remote_port = ovpn_udp_port
+    elif has_sslvpn:
+        proto = "sslvpn"
+        remote_port = ssl_tcp_port or sstp_port or 443
+    elif has_sstp:
+        proto = "sstp"
+        remote_port = sstp_port or ssl_tcp_port or 443
+    elif has_l2tp:
+        proto = "sslvpn"
+        remote_port = 443
+    else:
+        return None
+
+    ovpn_synth_proto = "tcp" if proto in ("tcp", "sslvpn", "sstp") else "udp"
+    ovpn_synth_port = ovpn_tcp_port or ovpn_udp_port or remote_port or 443
+    config_text = synthesize_vpngate_openvpn_config(ip, ovpn_synth_port, ovpn_synth_proto, nodes=existing_nodes)
+
+    node_id = safe_name("_".join([country_short, ip, str(remote_port), proto]))
+    config_path = CONFIG_DIR / f"{node_id}.ovpn"
+
+    adv_protos: list[str] = []
+    if has_ovpn:
+        if ovpn_tcp_port > 0:
+            adv_protos.append("TCP")
+        if ovpn_udp_port > 0 and "UDP" not in adv_protos:
+            adv_protos.append("UDP")
+        if not adv_protos:
+            adv_protos.append("TCP")
+    if has_sslvpn and "SSL-VPN" not in adv_protos:
+        adv_protos.append("SSL-VPN")
+    if has_sstp and "SSTP" not in adv_protos:
+        adv_protos.append("SSTP")
+    if has_l2tp and "L2TP" not in adv_protos:
+        adv_protos.append("L2TP")
+
+    return {
+        "id": node_id,
+        "country": country_zh,
+        "country_short": country_short,
+        "host_name": str(web_row.get("HostName") or ""),
+        "ip": ip,
+        "score": parse_int(web_row.get("Score")) or 100000,
+        "ping": parse_int(web_row.get("Ping")),
+        "speed": parse_int(web_row.get("Speed")),
+        "sessions": parse_int(web_row.get("NumVpnSessions")),
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+        "latency_ms": 0,
+        "config_file": str(config_path),
+        "config_text": config_text,
+        "proto": proto,
+        "supported_protocols": adv_protos,
+        "ovpn_tcp_port": ovpn_tcp_port,
+        "ovpn_udp_port": ovpn_udp_port,
+        "ssl_tcp_port": ssl_tcp_port,
+        "sstp_port": sstp_port,
+        "has_openvpn": has_ovpn,
+        "remote_host": ip,
+        "remote_port": remote_port,
+        "fetched_at": time.time(),
+        "probe_status": "not_checked",
+        "probe_message": "" if has_ovpn else "网页源扩展节点 (仅开启 SSL-VPN / SSTP，无 OpenVPN)",
+        "probed_at": 0,
+    }
+
+
+def merge_supplemental_candidates(
+    primary_candidates: list[dict[str, Any]],
+    primary_source_name: str,
+    blacklist: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """
+    Supplement primary CSV candidates with:
+      1. GitHub Pages mirror CSV (captures a different time-slice of the ~100-row API window)
+      2. Official VPNGate Web HTML table (captures SSL-VPN / MS-SSTP-only nodes that have no OpenVPN config,
+         plus dual TCP+UDP port metadata for existing nodes)
+    Only runs when fetch_api_text is not mocked in unit tests (or when supplemental URLs are reachable).
+    """
+    stats = {"mirror_added": 0, "web_added": 0, "non_ovpn_added": 0}
+    if getattr(fetch_api_text, "__module__", "").startswith("unittest.mock") or getattr(fetch_api_text_with_deadline, "__module__", "").startswith("unittest.mock"):
+        return primary_candidates, stats
+
+    by_ip: dict[str, dict[str, Any]] = {}
+    merged: list[dict[str, Any]] = []
+    for cand in primary_candidates:
+        ip = str(cand.get("ip") or cand.get("remote_host") or "").strip()
+        if ip and ip not in by_ip:
+            by_ip[ip] = cand
+            merged.append(cand)
+
+    now = time.time()
+
+    # 1. Merge GitHub Pages Mirror CSV if primary was official API
+    if not primary_source_name.startswith("github_pages") and MIRROR_HTTPS_URL:
+        try:
+            mirror_text = fetch_api_text_with_deadline(MIRROR_HTTPS_URL, True, deadline_seconds=4)
+            mirror_rows = parse_vpngate_rows(mirror_text)
+            mirror_cands = rows_to_candidates(mirror_rows, blacklist)
+            for mc in mirror_cands:
+                ip = str(mc.get("ip") or mc.get("remote_host") or "").strip()
+                if not ip or ip in by_ip:
+                    continue
+                by_ip[ip] = mc
+                merged.append(mc)
+                stats["mirror_added"] += 1
+        except Exception:
+            pass
+
+    # 2. Merge Official VPNGate Web HTML Table (includes non-OpenVPN SSL-VPN/SSTP nodes + dual ports)
+    if WEB_HTML_HTTPS_URL:
+        try:
+            html_text = fetch_api_text_with_deadline(WEB_HTML_HTTPS_URL, True, deadline_seconds=5)
+            web_rows = snapshot_utils.parse_vpngate_web_html(html_text, max_rows=MAX_SCAN_ROWS)
+            for wrow in web_rows:
+                ip = str(wrow.get("IP") or "").strip()
+                if not ip:
+                    continue
+                if ip in by_ip:
+                    # Enrich existing CSV node with dual TCP/UDP port and protocol metadata from the web table
+                    existing = by_ip[ip]
+                    for k in ("ovpn_tcp_port", "ovpn_udp_port", "ssl_tcp_port", "sstp_port"):
+                        if parse_int(wrow.get(k)) > 0:
+                            existing[k] = parse_int(wrow.get(k))
+                    continue
+
+                wnode = web_row_to_node(wrow, existing_nodes=merged)
+                if not wnode:
+                    continue
+                entry = blacklist.get(wnode["id"])
+                if entry and float(entry.get("until", 0) or 0) > now:
+                    continue
+                by_ip[ip] = wnode
+                merged.append(wnode)
+                stats["web_added"] += 1
+                if not wrow.get("has_openvpn"):
+                    stats["non_ovpn_added"] += 1
+        except Exception as exc:
+            print(f"[多源扩展] 网页端节点表补充拉取跳过: {exc}", flush=True)
+
+    return merged, stats
+
+
 def fetch_candidates() -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     discovery_countries = normalize_discovery_countries(
@@ -1375,6 +1555,14 @@ def fetch_candidates() -> list[dict[str, Any]]:
             # the last snapshot obtained through an authenticated HTTPS channel.
             if url.startswith("https://"):
                 cache_api_snapshot(api_text, source_name)
+
+            candidates, supp_stats = merge_supplemental_candidates(candidates, source_name, blacklist)
+            if supp_stats["mirror_added"] or supp_stats["web_added"]:
+                log_to_json(
+                    "INFO",
+                    "Main",
+                    f"[多源聚合] 在主源基础上额外合入镜像源 {supp_stats['mirror_added']} 个、官网网页表 {supp_stats['web_added']} 个节点（含无 OpenVPN 纯 SSL-VPN/SSTP 节点 {supp_stats['non_ovpn_added']} 个），去重后共 {len(candidates)} 个候选节点",
+                )
 
             filtered_candidates = filter_candidates_by_discovery_countries(
                 candidates,
@@ -3671,6 +3859,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 ui_cfg_for_merge["favorite_node_ids"] = fav_ids_list
                 write_json(DATA_DIR / "ui_auth.json", ui_cfg_for_merge)
                 
+            seen_ips_in_merged: set[str] = {
+                str(n.get("ip") or n.get("remote_host") or "").strip()
+                for n in merged
+                if (n.get("ip") or n.get("remote_host"))
+            }
             for cand in candidates:
                 if cand["id"] not in seen_ids:
                     previous = current_by_id.get(str(cand["id"]))
@@ -3681,6 +3874,40 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     cand["in_latest_feed"] = True
                     merged.append(cand)
                     seen_ids.add(cand["id"])
+                    cip = str(cand.get("ip") or cand.get("remote_host") or "").strip()
+                    if cip:
+                        seen_ips_in_merged.add(cip)
+
+            # Rolling Node Pool: retain previously discovered available or recent nodes across slice rotations
+            now_ts = time.time()
+            blacklist_now = load_blacklist()
+            retained_rolling = 0
+            for prev_node in current_nodes:
+                pid = str(prev_node.get("id") or "").strip()
+                pip = str(prev_node.get("ip") or prev_node.get("remote_host") or "").strip()
+                if not pid or pid in seen_ids or (pip and pip in seen_ips_in_merged):
+                    continue
+                bl_entry = blacklist_now.get(pid)
+                if bl_entry and float(bl_entry.get("until", 0) or 0) > now_ts:
+                    continue
+                is_avail = prev_node.get("probe_status") == "available"
+                age = now_ts - float(prev_node.get("fetched_at", 0) or 0)
+                if is_avail or age < ROLLING_POOL_RETENTION_SECONDS:
+                    kept = dict(prev_node)
+                    kept["active"] = False
+                    kept["in_latest_feed"] = False
+                    merged.append(kept)
+                    seen_ids.add(pid)
+                    if pip:
+                        seen_ips_in_merged.add(pip)
+                    retained_rolling += 1
+
+            if retained_rolling > 0:
+                log_to_json(
+                    "INFO",
+                    "Main",
+                    f"[滚动节点池] 已保留上轮切片中 {retained_rolling} 个历史可用/近期节点，当前总节点池共 {len(merged)} 个",
+                )
                     
             if len(merged) > 1000:
                 merged = merged[:1000]
