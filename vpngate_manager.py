@@ -112,7 +112,6 @@ WEB_HTML_HTTPS_URL = os.environ.get(
     "VPNGATE_WEB_HTML_HTTPS_URL",
     "https://www.vpngate.net/en/",
 ).strip()
-ROLLING_POOL_RETENTION_SECONDS = env_int("ROLLING_POOL_RETENTION_SECONDS", 12 * 3600, 300, 7 * 24 * 3600)
 # Kept as the primary URL for diagnostics and backwards-compatible state output.
 API_URL = API_HTTPS_URL
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
@@ -1454,6 +1453,239 @@ def web_row_to_node(
         "probe_message": "" if has_ovpn else "网页源扩展节点 (仅开启 SSL-VPN / SSTP，无 OpenVPN)",
         "probed_at": 0,
     }
+
+
+def parse_and_import_manual_nodes(
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Parse user-supplied manual nodes and merge them into NODES_FILE (and optionally favorite_node_ids).
+    Supports three input modes in payload:
+      1. ovpn_text: Full .ovpn profile text (with or without inline certs; if certs missing, standard VPNGate certs are synthesized)
+      2. lines_text: Multi-line or single-line text of endpoints, e.g.:
+         - 219.100.37.184:443
+         - tcp://219.100.37.184:443
+         - sslvpn://vpn445562347.opengw.net:443
+         - sstp://118.86.75.249:443
+         - JP 126.63.159.81 1969 udp
+      3. host / port / proto / country_short: Structured single-node fields
+    """
+    raw_text = str(payload.get("raw_text") or payload.get("ovpn_text") or payload.get("lines_text") or "").strip()
+    struct_host = str(payload.get("host") or payload.get("ip") or "").strip()
+    struct_port = parse_int(payload.get("port"))
+    struct_proto = vpn_utils.normalize_vpn_protocol(payload.get("proto") or "tcp")
+    default_country_short = str(payload.get("country_short") or "JP").strip().upper() or "JP"
+    if not re.fullmatch(r"[A-Z]{2}", default_country_short):
+        default_country_short = "JP"
+    add_to_favorites = bool(payload.get("add_to_favorites", True))
+
+    code_to_zh = {
+        "JP": "日本", "KR": "韩国", "US": "美国", "TW": "台湾", "HK": "香港",
+        "SG": "新加坡", "TH": "泰国", "VN": "越南", "GB": "英国", "DE": "德国",
+        "FR": "法国", "NL": "荷兰", "CA": "加拿大", "AU": "澳大利亚", "RU": "俄罗斯",
+        "IN": "印度", "MY": "马来西亚", "ID": "印度尼西亚", "PH": "菲律宾", "BR": "巴西",
+    }
+
+    with lock:
+        current_nodes = read_nodes()
+
+    imported_specs: list[tuple[str, int, str, str, str, str]] = []
+    # tuple: (resolved_ip, port, proto, country_short, host_name, custom_ovpn_text)
+
+    if "<ca>" in raw_text or "remote " in raw_text.lower() and ("client" in raw_text.lower() or "dev tun" in raw_text.lower()):
+        r_host, r_port, r_proto = vpn_utils.parse_remote(raw_text, "")
+        if not r_host:
+            raise ValueError("未能在 .ovpn 配置中找到有效的 remote 主机地址")
+        p_norm = vpn_utils.normalize_vpn_protocol(r_proto if r_proto != "unknown" else struct_proto)
+        port_num = r_port or struct_port or (443 if p_norm in ("tcp", "sslvpn", "sstp") else 1194)
+        cfg_text = raw_text
+        if "<ca>" not in cfg_text:
+            cfg_text = synthesize_vpngate_openvpn_config(r_host, port_num, "udp" if p_norm == "udp" else "tcp", nodes=current_nodes)
+        imported_specs.append((r_host, port_num, p_norm, default_country_short, "", cfg_text))
+    else:
+        lines_to_parse: list[str] = []
+        if raw_text:
+            lines_to_parse.extend(raw_text.splitlines())
+        elif struct_host:
+            lines_to_parse.append(f"{struct_proto}://{struct_host}:{struct_port or 443}")
+
+        for raw_line in lines_to_parse:
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";", "//")):
+                continue
+            c_short = default_country_short
+            proto = struct_proto or "tcp"
+            host_val = ""
+            port_val = struct_port or 0
+
+            # Optional leading 2-letter country code: "JP 1.2.3.4:443"
+            parts = line.split()
+            if len(parts) >= 2 and re.fullmatch(r"[A-Za-z]{2}", parts[0]):
+                c_short = parts[0].upper()
+                line = " ".join(parts[1:]).strip()
+                parts = line.split()
+
+            # Check scheme://host:port
+            if "://" in line:
+                scheme, _, rest = line.partition("://")
+                proto = vpn_utils.normalize_vpn_protocol(scheme)
+                rest = rest.split("/")[0].strip()
+                if ":" in rest:
+                    h_part, _, p_part = rest.rpartition(":")
+                    host_val = h_part.strip()
+                    port_val = parse_int(p_part)
+                else:
+                    host_val = rest
+            elif len(parts) >= 2 and parts[1].isdigit():
+                # Format: "1.2.3.4 443 [tcp|udp|sslvpn|sstp]"
+                host_val = parts[0].strip()
+                port_val = parse_int(parts[1])
+                if len(parts) >= 3:
+                    proto = vpn_utils.normalize_vpn_protocol(parts[2])
+            elif ":" in line:
+                # Format: "1.2.3.4:443" or "1.2.3.4:1194/udp"
+                left, _, right = line.rpartition(":")
+                host_val = left.strip()
+                if "/" in right:
+                    p_str, _, pr_str = right.partition("/")
+                    port_val = parse_int(p_str)
+                    proto = vpn_utils.normalize_vpn_protocol(pr_str)
+                elif right.strip().split():
+                    r_tokens = right.strip().split()
+                    port_val = parse_int(r_tokens[0])
+                    if len(r_tokens) >= 2:
+                        proto = vpn_utils.normalize_vpn_protocol(r_tokens[1])
+                else:
+                    port_val = parse_int(right)
+            else:
+                host_val = parts[0].strip()
+
+            if not host_val:
+                continue
+            if port_val <= 0 or port_val > 65535:
+                port_val = 443 if proto in ("tcp", "sslvpn", "sstp") else 1194
+
+            h_name = ""
+            resolved_ip = host_val
+            if host_val.lower().endswith(".opengw.net"):
+                h_name = host_val[:-len(".opengw.net")]
+            elif not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host_val) and re.fullmatch(r"(?:vpn\d+|public-vpn-\d+)", host_val.lower()):
+                h_name = host_val.lower()
+                host_val = f"{h_name}.opengw.net"
+
+            if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host_val):
+                try:
+                    infos = socket.getaddrinfo(host_val, None, socket.AF_INET, socket.SOCK_STREAM)
+                    if infos:
+                        resolved_ip = str(infos[0][4][0])
+                except Exception:
+                    resolved_ip = host_val
+
+            cfg_text = synthesize_vpngate_openvpn_config(
+                resolved_ip,
+                port_val,
+                "udp" if proto == "udp" else "tcp",
+                nodes=current_nodes,
+            )
+            imported_specs.append((resolved_ip, port_val, proto, c_short, h_name, cfg_text))
+
+    if not imported_specs:
+        raise ValueError("未解析到有效的节点信息，请输入 IP:端口、域名:端口 或粘贴 .ovpn 配置内容")
+
+    imported_nodes: list[dict[str, Any]] = []
+    imported_ids: list[str] = []
+
+    with lock:
+        current_nodes = read_nodes()
+        by_id = {str(n.get("id")): n for n in current_nodes if n.get("id")}
+        ip_cache = vpn_utils.load_ip_cache()
+
+        for resolved_ip, port_val, proto, c_short, h_name, cfg_text in imported_specs:
+            nid = safe_name("_".join([c_short, resolved_ip, str(port_val), proto]))
+            cfg_path = CONFIG_DIR / f"{nid}.ovpn"
+            if cfg_text:
+                try:
+                    CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+                    cfg_path.write_text(cfg_text, encoding="utf-8")
+                except Exception:
+                    pass
+            country_zh = code_to_zh.get(c_short, c_short)
+            p_label = vpn_utils.format_vpn_protocol_label(proto)
+            if nid in by_id:
+                node_obj = by_id[nid]
+                node_obj["proto"] = proto
+                node_obj["remote_port"] = port_val
+                node_obj["remote_host"] = resolved_ip
+                node_obj["ip"] = resolved_ip
+                if h_name:
+                    node_obj["host_name"] = h_name
+                if cfg_text:
+                    node_obj["config_text"] = cfg_text
+                node_obj["fetched_at"] = time.time()
+            else:
+                node_obj = {
+                    "id": nid,
+                    "country": country_zh,
+                    "country_short": c_short,
+                    "host_name": h_name or nid,
+                    "ip": resolved_ip,
+                    "score": 500000,
+                    "ping": 0,
+                    "speed": 0,
+                    "sessions": 0,
+                    "owner": "",
+                    "asn": "",
+                    "as_name": "",
+                    "location": "",
+                    "ip_type": "",
+                    "quality": "",
+                    "latency_ms": 0,
+                    "config_file": str(cfg_path),
+                    "config_text": cfg_text,
+                    "proto": proto,
+                    "supported_protocols": [p_label],
+                    "remote_host": resolved_ip,
+                    "remote_port": port_val,
+                    "fetched_at": time.time(),
+                    "probe_status": "not_checked",
+                    "probe_message": f"手动导入节点 ({p_label}:{port_val})",
+                    "probed_at": 0,
+                    "active": False,
+                    "in_latest_feed": True,
+                }
+                cached_entry = ip_cache.get(resolved_ip) if isinstance(ip_cache, dict) else None
+                if isinstance(cached_entry, dict):
+                    vpn_utils.apply_ip_cache_entry(node_obj, cached_entry)
+                current_nodes.insert(0, node_obj)
+                by_id[nid] = node_obj
+
+            imported_nodes.append(node_obj)
+            if nid not in imported_ids:
+                imported_ids.append(nid)
+
+        ui_cfg = load_ui_config()
+        fav_ids = [str(x).strip() for x in ui_cfg.get("favorite_node_ids", []) if str(x or "").strip()]
+        if add_to_favorites:
+            for nid in imported_ids:
+                if nid not in fav_ids:
+                    fav_ids.insert(0, nid)
+            ui_cfg["favorite_node_ids"] = fav_ids
+            write_json(DATA_DIR / "ui_auth.json", ui_cfg)
+
+        sorted_all = sort_all_nodes(current_nodes)
+        write_json(NODES_FILE, sorted_all)
+        try:
+            sync_favorite_snapshots_with_nodes(fav_ids=fav_ids, nodes=sorted_all)
+        except Exception:
+            pass
+        ip_enrichment_wakeup.set()
+
+    log_to_json(
+        "INFO",
+        "Main",
+        f"[手动导入] 成功导入 {len(imported_ids)} 个节点: {', '.join(imported_ids[:5])}{' (已自动加入星标保活)' if add_to_favorites else ''}",
+    )
+    return imported_nodes, imported_ids
 
 
 def merge_supplemental_candidates(
@@ -3878,37 +4110,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if cip:
                         seen_ips_in_merged.add(cip)
 
-            # Rolling Node Pool: retain previously discovered available or recent nodes across slice rotations
-            now_ts = time.time()
-            blacklist_now = load_blacklist()
-            retained_rolling = 0
-            for prev_node in current_nodes:
-                pid = str(prev_node.get("id") or "").strip()
-                pip = str(prev_node.get("ip") or prev_node.get("remote_host") or "").strip()
-                if not pid or pid in seen_ids or (pip and pip in seen_ips_in_merged):
-                    continue
-                bl_entry = blacklist_now.get(pid)
-                if bl_entry and float(bl_entry.get("until", 0) or 0) > now_ts:
-                    continue
-                is_avail = prev_node.get("probe_status") == "available"
-                age = now_ts - float(prev_node.get("fetched_at", 0) or 0)
-                if is_avail or age < ROLLING_POOL_RETENTION_SECONDS:
-                    kept = dict(prev_node)
-                    kept["active"] = False
-                    kept["in_latest_feed"] = False
-                    merged.append(kept)
-                    seen_ids.add(pid)
-                    if pip:
-                        seen_ips_in_merged.add(pip)
-                    retained_rolling += 1
-
-            if retained_rolling > 0:
-                log_to_json(
-                    "INFO",
-                    "Main",
-                    f"[滚动节点池] 已保留上轮切片中 {retained_rolling} 个历史可用/近期节点，当前总节点池共 {len(merged)} 个",
-                )
-                    
             if len(merged) > 1000:
                 merged = merged[:1000]
                 
@@ -5777,6 +5978,9 @@ table.nodes{width:100%;min-width:1120px;border-collapse:separate;border-spacing:
       </div>
 
       <span class="spacer hide-sm"></span>
+      <button class="btn" id="importNodeBtn" type="button" title="手动添加 IP:端口、.opengw.net 域名或导入 .ovpn 配置文件">
+        <i data-i="plus"></i><span>手动导入节点</span>
+      </button>
       <button class="btn star-btn" id="starToggle" type="button" aria-expanded="false" aria-controls="drawer">
         ⭐ 星标常备池 <span class="cnt" id="poolCount">0</span><i data-i="chev"></i>
       </button>
@@ -6075,6 +6279,72 @@ table.nodes{width:100%;min-width:1120px;border-collapse:separate;border-spacing:
   </div>
 </div>
 
+<!-- ================= IMPORT NODE MODAL ================= -->
+<div class="modal" id="importModal" role="dialog" aria-modal="true" aria-labelledby="importTitle" aria-hidden="true">
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-dialog" style="width:min(640px,100%)">
+    <div class="modal-head">
+      <div class="mh-left">
+        <div class="mh-ic"><i data-i="plus"></i></div>
+        <div>
+          <h3 id="importTitle">手动导入节点</h3>
+          <p>支持直接输入 IP/域名:端口、批量粘贴地址或上传 .ovpn 配置文件</p>
+        </div>
+      </div>
+      <button class="icon-btn" data-close type="button" aria-label="关闭"><i data-i="x"></i></button>
+    </div>
+    <div class="modal-body" style="display:flex;flex-direction:column;gap:14px;">
+      <div class="form-grid">
+        <div class="fg">
+          <label for="impHost">快速单节点 · IP 或域名</label>
+          <input id="impHost" class="inp mono" placeholder="例如 219.100.37.184 或 vpn445562347.opengw.net">
+        </div>
+        <div class="fg">
+          <label for="impPort">端口 & 协议</label>
+          <div style="display:grid;grid-template-columns:96px 1fr 78px;gap:8px;">
+            <input id="impPort" class="inp mono" type="number" min="1" max="65535" value="443" placeholder="端口">
+            <select id="impProto" class="inp" style="cursor:pointer;">
+              <option value="tcp">OpenVPN TCP</option>
+              <option value="udp">OpenVPN UDP</option>
+              <option value="sslvpn">SoftEther SSL-VPN</option>
+              <option value="sstp">MS-SSTP</option>
+            </select>
+            <input id="impCountry" class="inp mono" maxlength="2" value="JP" placeholder="JP" title="两位国家代码 (如 JP, KR, US)">
+          </div>
+        </div>
+      </div>
+
+      <div class="fg">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <label for="impRawText">批量地址列表 或 完整 .ovpn 配置内容（可选）</label>
+          <label class="btn btn-sm btn-ghost" style="cursor:pointer;margin:0;">
+            <i data-i="upload"></i>读取本地 .ovpn 文件
+            <input type="file" id="impOvpnFile" accept=".ovpn,.conf,.txt" style="display:none;">
+          </label>
+        </div>
+        <textarea id="impRawText" class="inp mono" rows="6" style="resize:vertical;min-height:110px;line-height:1.5;padding:10px 12px;" placeholder="支持每行一个节点（自动合成 VPNGate 证书），或直接粘贴完整 .ovpn 文件内容：&#10;219.100.37.184:443&#10;udp://126.63.159.81:1969&#10;sslvpn://vpn445562347.opengw.net:443&#10;sstp://118.86.75.249:443"></textarea>
+      </div>
+
+      <div style="display:flex;flex-wrap:wrap;gap:18px;align-items:center;padding:4px 2px;">
+        <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:12.5px;">
+          <input type="checkbox" class="cb" id="impAddFav" checked>
+          <span>自动加入 ⭐ 星标常备池（订阅刷新永不丢失）</span>
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:12.5px;">
+          <input type="checkbox" class="cb" id="impAutoProbe" checked>
+          <span>导入后立即在后台测速与检测协议</span>
+        </label>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <span class="muted" style="font-size:12px;">若未带证书，系统会自动补全标准 VPNGate 证书并支持四协议自适应</span>
+      <span class="spacer"></span>
+      <button class="btn" data-close type="button">取消</button>
+      <button class="btn btn-primary" id="submitImportBtn" type="button"><i data-i="check"></i>确认导入</button>
+    </div>
+  </div>
+</div>
+
 <!-- ================= VPS RECOMMEND MODAL ================= -->
 <div class="modal" id="vpsModal" role="dialog" aria-modal="true" aria-labelledby="vpsTitle" aria-hidden="true">
   <div class="modal-backdrop" data-close></div>
@@ -6206,7 +6476,9 @@ const ICONS = {
   lock:'<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
   spark:'<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/>',
   download:'<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
-  info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>'
+  info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+  plus:'<path d="M12 5v14M5 12h14"/>',
+  upload:'<path d="M12 20V9M7 14l5-5 5 5M5 4h14"/>'
 };
 const icon = (n, c = '') => `<svg class="ic ${c}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n] || ''}</svg>`;
 const hydrate = (root = document) => qsa('i[data-i]', root).forEach(el => { el.outerHTML = icon(el.dataset.i, el.className); });
@@ -8364,6 +8636,71 @@ if ($("syncBtn")) {
 }
 
 if ($("openVpsBtn")) {
+  if ($("importNodeBtn")) {
+    $("importNodeBtn").addEventListener("click", () => openModal("importModal"));
+  }
+  if ($("impOvpnFile")) {
+    $("impOvpnFile").addEventListener("change", (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        if ($("impRawText")) $("impRawText").value = String(reader.result || "");
+        toast("已读取配置文件", file.name, "info");
+      };
+      reader.readAsText(file, "utf-8");
+      ev.target.value = "";
+    });
+  }
+  if ($("submitImportBtn")) {
+    $("submitImportBtn").addEventListener("click", async () => {
+      const btn = $("submitImportBtn");
+      const rawText = ($("impRawText") ? $("impRawText").value : "").trim();
+      const host = ($("impHost") ? $("impHost").value : "").trim();
+      const port = Number($("impPort") ? $("impPort").value : 443) || 443;
+      const proto = $("impProto") ? $("impProto").value : "tcp";
+      const countryShort = (($("impCountry") ? $("impCountry").value : "JP") || "JP").trim().toUpperCase();
+      const addFav = $("impAddFav") ? $("impAddFav").checked : true;
+      const autoProbe = $("impAutoProbe") ? $("impAutoProbe").checked : true;
+
+      if (!rawText && !host) {
+        toast("请输入节点信息", "请填写 IP/域名，或在下方粘贴批量地址 / .ovpn 配置内容", "warn");
+        return;
+      }
+
+      btn.disabled = true;
+      try {
+        const res = await fetchWithTimeout(apiPath("/api/import_nodes"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            raw_text: rawText,
+            host: host,
+            port: port,
+            proto: proto,
+            country_short: countryShort,
+            add_to_favorites: addFav,
+            auto_probe: autoProbe
+          })
+        });
+        const data = await readJsonResponse(res, "导入节点失败");
+        if ($("impHost")) $("impHost").value = "";
+        if ($("impRawText")) $("impRawText").value = "";
+        closeModal("importModal");
+        toast("节点导入成功", data.message || `已导入 ${data.count || 1} 个节点`, "ok");
+        await load(true);
+        if (autoProbe && Array.isArray(data.imported_ids) && data.imported_ids.length > 0) {
+          data.imported_ids.forEach(id => testingNodeIds.add(id));
+          renderTable();
+          startBatchTestPolling();
+        }
+      } catch (err) {
+        toast("导入失败", err.message || String(err), "err");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
   $("openVpsBtn").addEventListener('click', () => openModal('vpsModal'));
 }
 
@@ -9182,6 +9519,32 @@ class Handler(BaseHTTPRequestHandler):
                     policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "收藏列表已更新")
                 
                 self.send_json({"ok": True, "favorite_node_ids": fav_ids, "message": policy_message or ""})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/import_nodes":
+            try:
+                payload = self.read_json_body()
+                imported_nodes, imported_ids = parse_and_import_manual_nodes(payload)
+                auto_probe = bool(payload.get("auto_probe", True))
+                if auto_probe and imported_ids and not maintenance_lock.locked() and not is_connecting:
+                    def _bg_probe_imported(ids_to_test: list[str]) -> None:
+                        try:
+                            test_multiple_nodes(ids_to_test, target_available=None)
+                        except Exception as exc:
+                            print(f"[手动导入测速] 失败: {exc}", flush=True)
+                    threading.Thread(target=_bg_probe_imported, args=(imported_ids,), daemon=True).start()
+                ui_cfg = load_ui_config()
+                self.send_json({
+                    "ok": True,
+                    "imported_ids": imported_ids,
+                    "count": len(imported_ids),
+                    "favorite_node_ids": ui_cfg.get("favorite_node_ids", []),
+                    "message": f"成功导入 {len(imported_ids)} 个节点" + ("，已在后台启动多协议连通性检测" if auto_probe else ""),
+                })
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return

@@ -1371,6 +1371,23 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("SSL-VPN", wnode["supported_protocols"])
         self.assertIn("SSTP", wnode["supported_protocols"])
 
+    def test_manual_node_import_supports_batch_lines_and_favorites(self) -> None:
+        self.write_nodes(1)
+        imported_nodes, imported_ids = manager.parse_and_import_manual_nodes(
+            {
+                "raw_text": "219.100.37.184:443\nudp://126.63.159.81:1969\nsslvpn://118.86.75.249:443",
+                "country_short": "JP",
+                "add_to_favorites": True,
+            }
+        )
+        self.assertEqual(3, len(imported_ids))
+        self.assertIn("JP_219.100.37.184_443_tcp", imported_ids)
+        self.assertIn("JP_126.63.159.81_1969_udp", imported_ids)
+        self.assertIn("JP_118.86.75.249_443_sslvpn", imported_ids)
+        favs = manager.load_ui_config()["favorite_node_ids"]
+        for nid in imported_ids:
+            self.assertIn(nid, favs)
+
 
 class ProxyServerConcurrencyTests(unittest.TestCase):
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
