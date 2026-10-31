@@ -2793,15 +2793,32 @@ def extract_node_region(node: dict[str, Any]) -> str:
                     return normalize_region_token(rparts[1])
     return ""
 
+def normalize_region_list(target_region: Any) -> list[str]:
+    if isinstance(target_region, (list, tuple, set)):
+        raw_items = [str(x or "") for x in target_region]
+    else:
+        raw_items = re.split(r"[,，/|;；]+", str(target_region or ""))
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        norm = normalize_region_token(item)
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
 def node_matches_region(node: dict[str, Any], target_region: Any) -> bool:
-    target = normalize_region_token(str(target_region or ""))
-    if not target:
+    targets = normalize_region_list(target_region)
+    if not targets:
         return True
     node_reg = extract_node_region(node)
-    if node_reg and (node_reg == target or target in node_reg or node_reg in target):
-        return True
     loc = str(node.get("location") or "")
-    return target in loc
+    for target in targets:
+        if node_reg and (node_reg == target or target in node_reg or node_reg in target):
+            return True
+        if target in loc:
+            return True
+    return False
 
 def apply_routing_filters(
     nodes: list[dict[str, Any]],
@@ -5944,10 +5961,16 @@ table.nodes{width:100%;min-width:1120px;border-collapse:separate;border-spacing:
         </div>
       </div>
 
-      <div class="dd dd-select" data-filter="region" id="regionDD">
+      <div class="dd dd-multi" data-filter="region" id="regionDD">
         <button class="select-btn" data-dd-trigger type="button"><span class="k">地区</span><span class="dd-label" id="regionDDLabel">全部地区</span><i data-i="chev"></i></button>
-        <div class="dd-menu" id="regionDDMenu">
-          <button class="dd-opt active" data-value="" type="button">全部地区 (都道府县)</button>
+        <div class="dd-menu w-220" id="regionDDMenu">
+          <div class="menu-label">选择地区 / 都道府县（可多选）</div>
+          <div id="regionDDOptions" style="max-height:240px;overflow-y:auto;"></div>
+          <div class="menu-sep"></div>
+          <div class="mm-foot">
+            <button class="btn btn-sm btn-ghost" data-reg-mm="clear" type="button">清除</button>
+            <button class="btn btn-sm" data-reg-mm="all" type="button">全选</button>
+          </div>
         </div>
       </div>
 
@@ -5995,11 +6018,17 @@ table.nodes{width:100%;min-width:1120px;border-collapse:separate;border-spacing:
           </div>
           <div class="dr-grid">
             <div class="field">
-              <span class="fl">轮换地区限定 (都道府县)</span>
-              <div class="dd dd-select" id="poolRegion">
+              <span class="fl">轮换地区限定 (都道府县 · 可多选)</span>
+              <div class="dd dd-multi" id="poolRegion">
                 <button class="select-btn" data-dd-trigger type="button"><i data-i="pin" class="pin-ic"></i><span class="dd-label" id="poolRegionLabel">不限地区 (全部星标)</span><i data-i="chev"></i></button>
                 <div class="dd-menu w-220" id="poolRegionMenu">
-                  <button class="dd-opt active" data-value="" type="button">不限地区 (全部星标)</button>
+                  <div class="menu-label">选择星标轮换地区（可多选）</div>
+                  <div id="poolRegionOptions" style="max-height:220px;overflow-y:auto;"></div>
+                  <div class="menu-sep"></div>
+                  <div class="mm-foot">
+                    <button class="btn btn-sm btn-ghost" data-pool-reg-mm="clear" type="button">不限地区</button>
+                    <button class="btn btn-sm" data-pool-reg-mm="all" type="button">全选地区</button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -6040,6 +6069,7 @@ table.nodes{width:100%;min-width:1120px;border-collapse:separate;border-spacing:
         <button class="btn btn-sm btn-ghost" data-sel="page" type="button">全选本页</button>
         <button class="btn btn-sm btn-ghost" data-sel="filter" type="button">全选当前筛选</button>
         <button class="btn btn-sm btn-ghost" data-sel="pending" type="button">勾选待测</button>
+        <button class="btn btn-sm btn-ghost" data-sel="unscored_intel" type="button" title="一键勾选当前筛选列表中尚未进行三源情报对比评估的节点">勾选未三源评估</button>
         <button class="btn btn-sm btn-ghost" data-sel="clear" type="button">清空</button>
       </div>
       <div class="bb-right">
@@ -6405,7 +6435,26 @@ const intelTestingIds = new Set();
 const favoriteRequestIds = new Set();
 const selectedNodeIds = new Set();
 let selectedDiscoveryCountries = new Set();
+let selectedFilterRegions = new Set();
 let discoveryCountriesInitialized = false;
+
+function parseRegionSet(raw) {
+  const s = new Set();
+  if (!raw) return s;
+  const arr = Array.isArray(raw) ? raw : String(raw).split(/[,，/|;；]+/);
+  arr.forEach(item => {
+    const v = String(item || "").trim();
+    if (v) s.add(v);
+  });
+  return s;
+}
+
+function formatRegionSummary(regSetOrStr, emptyText) {
+  const s = regSetOrStr instanceof Set ? Array.from(regSetOrStr) : Array.from(parseRegionSet(regSetOrStr));
+  if (s.length === 0) return emptyText;
+  if (s.length === 1) return s[0];
+  return `${s[0]} +${s.length - 1}`;
+}
 let discoveryCountriesDirty = false;
 let showFavoritesOnly = false;
 let disconnectInFlight = false;
@@ -6752,34 +6801,45 @@ function updateCountryAndRegionMenus() {
     allRegs.set(reg, (allRegs.get(reg) || 0) + 1);
   });
 
-  const regMenu = $("regionDDMenu");
-  if (regMenu) {
+  const regOptsEl = $("regionDDOptions");
+  if (regOptsEl) {
     const sortedRegs = Array.from(allRegs.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
-    let html = `<button class="dd-opt ${filters.region === '' ? 'active' : ''}" data-value="" type="button">全部地区</button>`;
-    if (sortedRegs.length > 0) html += '<div class="menu-sep"></div>';
-    sortedRegs.forEach(([reg, cnt]) => {
-      html += `<button class="dd-opt ${filters.region === reg ? 'active' : ''}" data-value="${esc(reg)}" type="button">${esc(reg)} <span class="muted mono" style="margin-left:auto;font-size:11px;">${cnt}</span></button>`;
+    Array.from(selectedFilterRegions).forEach(r => {
+      if (!allRegs.has(r)) selectedFilterRegions.delete(r);
     });
-    regMenu.innerHTML = html;
-    if (filters.region && !allRegs.has(filters.region)) {
-      filters.region = '';
+    filters.region = Array.from(selectedFilterRegions).join(",");
+    if (sortedRegs.length === 0) {
+      regOptsEl.innerHTML = '<div style="padding:10px 12px;color:var(--text-3);font-size:12px;">暂无细分地区数据</div>';
+    } else {
+      regOptsEl.innerHTML = sortedRegs.map(([reg, cnt]) => {
+        const checked = selectedFilterRegions.has(reg) ? "checked" : "";
+        return `<label class="check-row"><input type="checkbox" class="cb region-option-input" value="${esc(reg)}" ${checked}><span>${esc(reg)}</span><span class="cnt mono">${cnt}</span></label>`;
+      }).join("");
     }
-    if ($("regionDDLabel")) $("regionDDLabel").textContent = filters.region || "全部地区";
+    if ($("regionDDLabel")) {
+      $("regionDDLabel").textContent = formatRegionSummary(selectedFilterRegions, "全部地区");
+    }
   }
 
-  const poolMenu = $("poolRegionMenu");
-  if (poolMenu) {
-    const curFavReg = String(state.fav_region || "").trim();
-    const sortedFavRegs = Array.from(favRegs.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
-    if (curFavReg && !favRegs.has(curFavReg)) sortedFavRegs.unshift([curFavReg, 0]);
-    let html = `<button class="dd-opt ${curFavReg === '' ? 'active' : ''}" data-value="" type="button">不限地区 (全部星标)</button>`;
-    if (sortedFavRegs.length > 0) html += '<div class="menu-sep"></div>';
-    sortedFavRegs.forEach(([reg, cnt]) => {
-      html += `<button class="dd-opt ${curFavReg === reg ? 'active' : ''}" data-value="${esc(reg)}" type="button">仅 ${esc(reg)} (${cnt})</button>`;
+  const poolOptsEl = $("poolRegionOptions");
+  if (poolOptsEl) {
+    const curFavSet = parseRegionSet(state.fav_region);
+    curFavSet.forEach(r => {
+      if (!favRegs.has(r)) favRegs.set(r, 0);
     });
-    poolMenu.innerHTML = html;
+    const sortedFavRegs = Array.from(favRegs.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
+    if (sortedFavRegs.length === 0) {
+      poolOptsEl.innerHTML = '<div style="padding:10px 12px;color:var(--text-3);font-size:12px;">暂无星标节点地区数据</div>';
+    } else {
+      poolOptsEl.innerHTML = sortedFavRegs.map(([reg, cnt]) => {
+        const checked = curFavSet.has(reg) ? "checked" : "";
+        return `<label class="check-row"><input type="checkbox" class="cb pool-region-option-input" value="${esc(reg)}" ${checked}><span>${esc(reg)}</span><span class="cnt mono">${cnt}</span></label>`;
+      }).join("");
+    }
     if ($("poolRegionLabel")) {
-      $("poolRegionLabel").textContent = curFavReg ? `仅 ${curFavReg}` : "不限地区 (全部星标)";
+      $("poolRegionLabel").textContent = curFavSet.size > 0
+        ? `仅 ${formatRegionSummary(curFavSet, "")}`
+        : "不限地区 (全部星标)";
     }
   }
 }
@@ -6948,8 +7008,9 @@ function renderKpisAndPool() {
 
   if ($("kpiTotal")) $("kpiTotal").textContent = String(total);
   if ($("kpiStarSub")) {
+    const favRegDisplay = formatRegionSummary(state.fav_region, "");
     const modeNote = state.routing_mode === "favorites"
-      ? ` · 仅星标轮换中${state.fav_region ? '(' + state.fav_region + ')' : ''}`
+      ? ` · 仅星标轮换中${favRegDisplay ? '(' + favRegDisplay + ')' : ''}`
       : "";
     $("kpiStarSub").textContent = `★ 星标常备池 ${favIds.length} 个节点${modeNote}`;
   }
@@ -7011,7 +7072,8 @@ function renderKpisAndPool() {
   const isFavRouting = state.routing_mode === "favorites";
   const sw = $("poolSwitch");
   if (sw) sw.setAttribute("aria-checked", isFavRouting ? "true" : "false");
-  const curFavReg = state.fav_region ? `仅 ${state.fav_region}` : "全部星标地区";
+  const favRegSet = parseRegionSet(state.fav_region);
+  const curFavReg = favRegSet.size > 0 ? `仅 ${Array.from(favRegSet).join(' / ')}` : "全部星标地区";
   if ($("poolSwitchText")) {
     $("poolSwitchText").textContent = isFavRouting
       ? `已启用 · 调度器仅在星标节点 (${curFavReg}) 中轮换`
@@ -7108,9 +7170,17 @@ function getFilteredNodes() {
     if (showFavoritesOnly && !isFav) return false;
     const cc = String(n.country_short || "").trim().toUpperCase();
     if (!showFavoritesOnly && selectedDiscoveryCountries.size && !selectedDiscoveryCountries.has(cc)) return false;
-    if (filters.region) {
+    if (selectedFilterRegions.size > 0) {
       const reg = getNodeRegion(n);
-      if (reg !== filters.region && !String(n.location || "").includes(filters.region)) return false;
+      const locStr = String(n.location || "");
+      let matchedReg = false;
+      for (const targetReg of selectedFilterRegions) {
+        if (reg === targetReg || locStr.includes(targetReg)) {
+          matchedReg = true;
+          break;
+        }
+      }
+      if (!matchedReg) return false;
     }
     if (filters.type) {
       if (filters.type === "residential" && !["residential", "mobile"].includes(n.ip_type)) return false;
@@ -8290,6 +8360,10 @@ qsa('[data-sel]').forEach(b => b.addEventListener('click', () => {
     selectedNodeIds.clear();
     shown.filter(n => n && (!n.probe_status || n.probe_status === 'not_checked')).forEach(n => selectedNodeIds.add(n.id));
     toast(`已勾选 ${selectedNodeIds.size} 个待检测节点`, 'info');
+  } else if (m === 'unscored_intel') {
+    selectedNodeIds.clear();
+    shown.filter(n => n && (n.intel_score === undefined || n.intel_score === null || n.intel_score === '')).forEach(n => selectedNodeIds.add(n.id));
+    toast(`已勾选 ${selectedNodeIds.size} 个尚未进行三源评估的节点`, 'info');
   } else {
     selectedNodeIds.clear();
   }
@@ -8413,10 +8487,70 @@ if (countryDD) {
   });
 }
 
+// Multi-select Region Filter (#regionDD)
+const regionDD = $("regionDD");
+if (regionDD) {
+  regionDD.addEventListener('change', e => {
+    if (!e.target.classList.contains('region-option-input')) return;
+    const reg = String(e.target.value || '').trim();
+    if (!reg) return;
+    if (e.target.checked) selectedFilterRegions.add(reg);
+    else selectedFilterRegions.delete(reg);
+    filters.region = Array.from(selectedFilterRegions).join(',');
+    if ($("regionDDLabel")) {
+      $("regionDDLabel").textContent = formatRegionSummary(selectedFilterRegions, "全部地区");
+    }
+    currentPage = 1;
+    render();
+  });
+  regionDD.addEventListener('click', e => {
+    const b = e.target.closest('[data-reg-mm]');
+    if (!b) return;
+    const inputs = qsa('.region-option-input', regionDD);
+    if (b.dataset.regMm === 'all') {
+      inputs.forEach(i => { i.checked = true; if (i.value) selectedFilterRegions.add(String(i.value).trim()); });
+    } else {
+      inputs.forEach(i => { i.checked = false; });
+      selectedFilterRegions.clear();
+    }
+    filters.region = Array.from(selectedFilterRegions).join(',');
+    if ($("regionDDLabel")) {
+      $("regionDDLabel").textContent = formatRegionSummary(selectedFilterRegions, "全部地区");
+    }
+    currentPage = 1;
+    render();
+  });
+}
+
+// Multi-select Star Pool Region (#poolRegion)
+const poolRegionDD = $("poolRegion");
+if (poolRegionDD) {
+  poolRegionDD.addEventListener('change', e => {
+    if (!e.target.classList.contains('pool-region-option-input')) return;
+    const inputs = qsa('.pool-region-option-input', poolRegionDD);
+    const chosen = inputs.filter(i => i.checked && i.value).map(i => String(i.value).trim());
+    updateStarPoolRouting(state.routing_mode === 'favorites', chosen.join(','));
+  });
+  poolRegionDD.addEventListener('click', e => {
+    const b = e.target.closest('[data-pool-reg-mm]');
+    if (!b) return;
+    const inputs = qsa('.pool-region-option-input', poolRegionDD);
+    if (b.dataset.poolRegMm === 'all') {
+      inputs.forEach(i => { i.checked = true; });
+      const chosen = inputs.filter(i => i.value).map(i => String(i.value).trim());
+      updateStarPoolRouting(state.routing_mode === 'favorites', chosen.join(','));
+    } else {
+      inputs.forEach(i => { i.checked = false; });
+      updateStarPoolRouting(state.routing_mode === 'favorites', '');
+    }
+  });
+}
+
 function resetAllFilters() {
   Object.assign(filters, { status: 'all', region: '', type: '', sort: 'default', q: '' });
   showFavoritesOnly = false;
   selectedDiscoveryCountries.clear();
+  selectedFilterRegions.clear();
   discoveryCountriesDirty = true;
   if ($("q")) $("q").value = '';
   qsa('.dd-select[data-filter]').forEach(dd => {
@@ -9445,7 +9579,7 @@ class Handler(BaseHTTPRequestHandler):
                 force_country = normalize_routing_country(payload.get("force_country"), read_nodes())
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 fav_region_specified = "fav_region" in payload
-                fav_region_val = normalize_region_token(str(payload.get("fav_region") or ""))
+                fav_region_val = ",".join(normalize_region_list(payload.get("fav_region")))
                 fav_fail_fallback = False
                 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):

@@ -1388,6 +1388,19 @@ class ManagerLogicTests(unittest.TestCase):
         for nid in imported_ids:
             self.assertIn(nid, favs)
 
+    def test_multi_region_matching_and_normalization_supports_multiple_prefectures(self) -> None:
+        self.assertEqual(
+            ["东京都", "大阪府", "茨城县"],
+            manager.normalize_region_list("Tokyo, 大阪, 茨城县, 东京都"),
+        )
+        node_tokyo = {"country": "日本", "country_short": "JP", "location": "日本 · 东京都 · 东京"}
+        node_osaka = {"country": "日本", "country_short": "JP", "location": "日本 · 大阪府 · 大阪"}
+        node_fukuoka = {"country": "日本", "country_short": "JP", "location": "日本 · 福冈县 · 福冈"}
+
+        self.assertTrue(manager.node_matches_region(node_tokyo, "东京都,大阪府"))
+        self.assertTrue(manager.node_matches_region(node_osaka, ["Tokyo", "Osaka"]))
+        self.assertFalse(manager.node_matches_region(node_fukuoka, "东京都,大阪府"))
+
 
 class ProxyServerConcurrencyTests(unittest.TestCase):
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
