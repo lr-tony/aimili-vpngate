@@ -5302,7 +5302,13 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   </div>
 
   <script>
-    function fetchWithTimeout(resource, options = {}, timeoutMs = 20000) {
+    function apiPath(p) {
+  const s = String(p || '');
+  if (s.startsWith('./')) return s;
+  return '.' + (s.startsWith('/') ? s : '/' + s);
+}
+
+function fetchWithTimeout(resource, options = {}, timeoutMs = 20000) {
       if (typeof AbortController === "undefined") return fetch(resource, options);
       const controller = new AbortController();
       const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -6650,6 +6656,12 @@ function isPageVisible() {
   return typeof document.hidden !== "boolean" || !document.hidden;
 }
 
+function apiPath(p) {
+  const s = String(p || '');
+  if (s.startsWith('./')) return s;
+  return '.' + (s.startsWith('/') ? s : '/' + s);
+}
+
 function fetchWithTimeout(resource, options = {}, timeoutMs = 20000) {
   if (typeof AbortController === "undefined") return fetch(resource, options);
   const controller = new AbortController();
@@ -7907,8 +7919,7 @@ async function toggleFavoriteNode(id) {
 async function connectToNode(id) {
   if (!id) return;
   const n = nodes.find(x => x && x.id === id);
-  if (n && n.probe_status === 'unavailable') { toast('该节点离线，请先测速可用后再切换', 'err'); return; }
-  state.is_connecting = true;
+    state.is_connecting = true;
   state.pending_node_id = id;
   render();
   toast(`正在切换主用节点 → <span class="mono">${esc((n && n.ip) || id)}</span>…`, 'info');
@@ -8496,7 +8507,7 @@ if ($("thSortLat")) {
       const lbl = $("sortDDLabel");
       if (lbl) lbl.textContent = filters.sort === "sessions_asc" ? "连接人数 · 少 → 多" : "连接人数 · 多 → 少";
       currentPage = 1;
-      renderTable();
+      render();
     });
   }
   if ($("thSortPurity")) {
@@ -8790,7 +8801,7 @@ if ($("poolViewSeg")) {
 
 qsa('[data-pool]').forEach(b => b.addEventListener('click', () => {
   const favIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids.filter(Boolean) : [];
-  if (favIds.length === 0) { toast('星标常备池中暂无收藏节点', 'warn'); return; }
+  if (favIds.length === 0 && b.dataset.pool !== 'backup_export') { toast('星标常备池中暂无收藏节点', 'warn'); return; }
   switch (b.dataset.pool) {
     case 'test': startBatchAvailabilityWithIds(favIds); break;
     case 'eval': startBatchCleanIpWithIds(favIds, 'cleanip', false); break;
@@ -8808,7 +8819,7 @@ qsa('[data-pool]').forEach(b => b.addEventListener('click', () => {
     case 'backup_export': {
       (async () => {
         try {
-          const res = await fetchWithTimeout(apiPath('/api/export_backup'), {}, 20000);
+          const res = await fetchWithTimeout('./api/export_backup', { cache: 'no-store' }, 20000);
           const data = await readJsonResponse(res, '导出星标备份失败');
           const blob = new Blob([JSON.stringify(data.backup || data, null, 2)], { type: 'application/json;charset=utf-8' });
           const url = URL.createObjectURL(blob);
@@ -8820,9 +8831,9 @@ qsa('[data-pool]').forEach(b => b.addEventListener('click', () => {
           a.click();
           a.remove();
           URL.revokeObjectURL(url);
-          toast('备份导出成功', `已导出 ${favIds.length} 个星标节点及纯净度缓存`, 'ok');
+          toast(`备份导出成功 · 已导出 ${favIds.length} 个星标节点及纯净度缓存`, 'ok');
         } catch (err) {
-          toast('导出备份失败', err.message || String(err), 'err');
+          toast('导出备份失败: ' + (err.message || String(err)), 'err');
         }
       })();
       break;
@@ -8982,16 +8993,16 @@ if ($("openVpsBtn")) {
       reader.onload = async () => {
         try {
           const parsed = JSON.parse(String(reader.result || "{}"));
-          const res = await fetchWithTimeout(apiPath("/api/import_backup"), {
+          const res = await fetchWithTimeout("./api/import_backup", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ backup: parsed })
           }, 25000);
           const data = await readJsonResponse(res, "导入备份恢复失败");
-          toast("备份恢复成功", data.message || "已恢复星标节点与纯净度缓存", "ok");
+          toast(data.message || "备份恢复成功 · 已恢复星标节点与纯净度缓存", "ok");
           await load(true);
         } catch (err) {
-          toast("备份恢复失败", err.message || "请确认上传的是有效的 .json 备份文件", "err");
+          toast("备份恢复失败: " + (err.message || "请确认上传的是有效的 .json 备份文件"), "err");
         }
       };
       reader.readAsText(file, "utf-8");
@@ -9008,7 +9019,7 @@ if ($("openVpsBtn")) {
       const reader = new FileReader();
       reader.onload = () => {
         if ($("impRawText")) $("impRawText").value = String(reader.result || "");
-        toast("已读取配置文件", file.name, "info");
+        toast("已读取配置文件: " + file.name, "info");
       };
       reader.readAsText(file, "utf-8");
       ev.target.value = "";
@@ -9026,13 +9037,13 @@ if ($("openVpsBtn")) {
       const autoProbe = $("impAutoProbe") ? $("impAutoProbe").checked : true;
 
       if (!rawText && !host) {
-        toast("请输入节点信息", "请填写 IP/域名，或在下方粘贴批量地址 / .ovpn 配置内容", "warn");
+        toast("请填写 IP/域名，或在下方粘贴批量地址 / .ovpn 配置内容", "warn");
         return;
       }
 
       btn.disabled = true;
       try {
-        const res = await fetchWithTimeout(apiPath("/api/import_nodes"), {
+        const res = await fetchWithTimeout("./api/import_nodes", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -9049,15 +9060,15 @@ if ($("openVpsBtn")) {
         if ($("impHost")) $("impHost").value = "";
         if ($("impRawText")) $("impRawText").value = "";
         closeModal("importModal");
-        toast("节点导入成功", data.message || `已导入 ${data.count || 1} 个节点`, "ok");
+        toast(data.message || `节点导入成功 · 已导入 ${data.count || 1} 个节点`, "ok");
         await load(true);
         if (autoProbe && Array.isArray(data.imported_ids) && data.imported_ids.length > 0) {
           data.imported_ids.forEach(id => testingNodeIds.add(id));
-          renderTable();
+          render();
           startBatchTestPolling();
         }
       } catch (err) {
-        toast("导入失败", err.message || String(err), "err");
+        toast("导入失败: " + (err.message || String(err)), "err");
       } finally {
         btn.disabled = false;
       }
