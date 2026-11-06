@@ -1688,10 +1688,30 @@ def parse_and_import_manual_nodes(
     return imported_nodes, imported_ids
 
 
+COMPACT_BACKUP_DROP_KEYS = {
+    "config_text",
+    "config_file",
+    "active",
+    "cleanip_report",
+    "intel_report",
+    "probe_message",
+}
+
+def _slim_snapshot_dict(raw_dict: dict[str, Any]) -> dict[str, Any]:
+    slim: dict[str, Any] = {}
+    for k, v in raw_dict.items():
+        if k in COMPACT_BACKUP_DROP_KEYS:
+            continue
+        if v in (None, "", [], {}):
+            continue
+        slim[k] = v
+    return slim
+
 def export_saved_nodes_backup() -> dict[str, Any]:
     """
-    Export all starred/saved nodes, their .ovpn configurations, adaptive protocols,
-    routing region preferences, and cached CleanIP / 3-source intelligence reports into a portable JSON dict.
+    Export all starred/saved nodes, their adaptive protocols/ports, routing region preferences,
+    and cached CleanIP / 3-source intelligence scores into a highly compact JSON dict
+    (stripping bulky 7KB .ovpn cert blocks and raw ASCII art reports).
     """
     with lock:
         ui_cfg = load_ui_config()
@@ -1703,42 +1723,23 @@ def export_saved_nodes_backup() -> dict[str, Any]:
         current_nodes = sync_favorite_snapshots_with_nodes(fav_ids=fav_ids)
         snapshots = load_favorite_snapshots()
         node_by_id = {str(n.get("id")): n for n in current_nodes if n.get("id")}
+        full_ip_cache = vpn_utils.load_ip_cache()
 
         export_snapshots: dict[str, dict[str, Any]] = {}
-        relevant_ips: set[str] = set()
+        exported_ip_cache: dict[str, Any] = {}
         for fid in fav_ids:
             snap = dict(snapshots.get(fid) or node_by_id.get(fid) or {})
             if not snap.get("id"):
                 continue
-            if not snap.get("config_text") and snap.get("config_file"):
-                try:
-                    cpath = Path(str(snap["config_file"]))
-                    if cpath.exists():
-                        snap["config_text"] = cpath.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    pass
-            snap["active"] = False
-            export_snapshots[fid] = snap
             ip_val = str(snap.get("ip") or snap.get("remote_host") or "").strip()
-            if ip_val:
-                relevant_ips.add(ip_val)
-
-        full_ip_cache = vpn_utils.load_ip_cache()
-        exported_ip_cache: dict[str, Any] = {}
-        if isinstance(full_ip_cache, dict):
-            for ip_key, cache_val in full_ip_cache.items():
-                if not isinstance(cache_val, dict):
-                    continue
-                has_scores = (
-                    cache_val.get("cleanip_score") not in (None, "")
-                    or cache_val.get("intel_score") not in (None, "")
-                )
-                if ip_key in relevant_ips or has_scores:
-                    exported_ip_cache[str(ip_key)] = cache_val
+            if ip_val and isinstance(full_ip_cache, dict) and isinstance(full_ip_cache.get(ip_val), dict):
+                vpn_utils.apply_ip_cache_entry(snap, full_ip_cache[ip_val])
+                exported_ip_cache[ip_val] = _slim_snapshot_dict(full_ip_cache[ip_val])
+            export_snapshots[fid] = _slim_snapshot_dict(snap)
 
         return {
-            "schema": "aimilivpn_backup_v1",
-            "exported_at": time.time(),
+            "schema": "aimilivpn_backup_v2",
+            "exported_at": int(time.time()),
             "app_version": APP_VERSION,
             "favorite_node_ids": fav_ids,
             "fav_region": str(ui_cfg.get("fav_region") or ""),
@@ -1750,7 +1751,8 @@ def export_saved_nodes_backup() -> dict[str, Any]:
 
 def import_saved_nodes_backup(payload: dict[str, Any]) -> dict[str, Any]:
     """
-    Restore starred/saved nodes, .ovpn files, and CleanIP / 3-source intelligence cache from a backup JSON dict.
+    Restore starred/saved nodes, synthesize .ovpn files, and restore CleanIP / 3-source intelligence
+    cache from either a v2 compact backup or a v1 full backup JSON dict.
     """
     data = payload.get("backup") if isinstance(payload.get("backup"), dict) else payload
     if not isinstance(data, dict):
@@ -1763,15 +1765,52 @@ def import_saved_nodes_backup(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw_fav_ids, list) and not isinstance(raw_snapshots, dict):
         raise ValueError("备份文件中未包含有效的星标节点数据 (favorite_node_ids / favorite_snapshots)")
 
+    incoming_snapshots = raw_snapshots if isinstance(raw_snapshots, dict) else {}
+    incoming_ids: list[str] = []
+    if isinstance(raw_fav_ids, list):
+        for fid in raw_fav_ids:
+            s_fid = str(fid or "").strip()
+            if s_fid and s_fid not in incoming_ids:
+                incoming_ids.append(s_fid)
+    for fid in incoming_snapshots.keys():
+        s_fid = str(fid or "").strip()
+        if s_fid and s_fid not in incoming_ids:
+            incoming_ids.append(s_fid)
+
     restored_cache_count = 0
+    current_cache = vpn_utils.load_ip_cache()
+    if not isinstance(current_cache, dict):
+        current_cache = {}
+
     if isinstance(raw_ip_cache, dict) and raw_ip_cache:
-        current_cache = vpn_utils.load_ip_cache()
-        if not isinstance(current_cache, dict):
-            current_cache = {}
         for ip_key, entry in raw_ip_cache.items():
             if ip_key and isinstance(entry, dict):
-                current_cache[str(ip_key)] = entry
+                merged_entry = dict(current_cache.get(str(ip_key)) or {})
+                merged_entry.update(_slim_snapshot_dict(entry))
+                current_cache[str(ip_key)] = merged_entry
                 restored_cache_count += 1
+
+    # Also seed IP cache from score fields embedded directly on favorite_snapshots
+    for fid in incoming_ids:
+        snap = incoming_snapshots.get(fid)
+        if not isinstance(snap, dict):
+            continue
+        ip_val = str(snap.get("ip") or snap.get("remote_host") or "").strip()
+        if not ip_val:
+            continue
+        cache_fields = {
+            k: v
+            for k, v in snap.items()
+            if k in IP_ENRICHMENT_FIELDS and k not in COMPACT_BACKUP_DROP_KEYS and v not in (None, "", [], {})
+        }
+        if cache_fields:
+            merged_entry = dict(current_cache.get(ip_val) or {})
+            merged_entry.update(cache_fields)
+            if ip_val not in (raw_ip_cache or {}):
+                restored_cache_count += 1
+            current_cache[ip_val] = merged_entry
+
+    if restored_cache_count > 0:
         vpn_utils.save_ip_cache(current_cache)
 
     restored_fav_count = 0
@@ -1785,31 +1824,21 @@ def import_saved_nodes_backup(payload: dict[str, Any]) -> dict[str, Any]:
         snapshots = load_favorite_snapshots()
         current_nodes = read_nodes()
 
-        incoming_snapshots = raw_snapshots if isinstance(raw_snapshots, dict) else {}
-        incoming_ids: list[str] = []
-        if isinstance(raw_fav_ids, list):
-            for fid in raw_fav_ids:
-                s_fid = str(fid or "").strip()
-                if s_fid and s_fid not in incoming_ids:
-                    incoming_ids.append(s_fid)
-        for fid in incoming_snapshots.keys():
-            s_fid = str(fid or "").strip()
-            if s_fid and s_fid not in incoming_ids:
-                incoming_ids.append(s_fid)
-
         for fid in incoming_ids:
             snap = incoming_snapshots.get(fid)
-            if isinstance(snap, dict) and snap.get("id"):
+            if isinstance(snap, dict) and (snap.get("id") or snap.get("ip") or snap.get("remote_host")):
                 node_copy = dict(snap)
                 node_copy["id"] = fid
                 node_copy["active"] = False
+                node_copy.setdefault("probe_status", "not_checked")
+                node_copy.setdefault("probe_message", "已从备份恢复星标节点")
                 cfg_path = CONFIG_DIR / f"{safe_name(fid)}.ovpn"
                 node_copy["config_file"] = str(cfg_path)
+                ip_val = str(node_copy.get("ip") or node_copy.get("remote_host") or "")
+                port_val = parse_int(node_copy.get("remote_port")) or 443
+                proto_val = str(node_copy.get("proto") or "tcp")
                 cfg_text = str(node_copy.get("config_text") or "")
-                if not cfg_text:
-                    ip_val = str(node_copy.get("ip") or node_copy.get("remote_host") or "")
-                    port_val = parse_int(node_copy.get("remote_port")) or 443
-                    proto_val = str(node_copy.get("proto") or "tcp")
+                if not cfg_text and ip_val:
                     cfg_text = synthesize_vpngate_openvpn_config(ip_val, port_val, proto_val, nodes=current_nodes)
                     node_copy["config_text"] = cfg_text
                 if cfg_text:
@@ -8821,7 +8850,7 @@ qsa('[data-pool]').forEach(b => b.addEventListener('click', () => {
         try {
           const res = await fetchWithTimeout('./api/export_backup', { cache: 'no-store' }, 20000);
           const data = await readJsonResponse(res, '导出星标备份失败');
-          const blob = new Blob([JSON.stringify(data.backup || data, null, 2)], { type: 'application/json;charset=utf-8' });
+          const blob = new Blob([JSON.stringify(data.backup || data)], { type: 'application/json;charset=utf-8' });
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           const dStr = new Date().toISOString().slice(0, 10);
@@ -8992,11 +9021,36 @@ if ($("openVpsBtn")) {
       const reader = new FileReader();
       reader.onload = async () => {
         try {
-          const parsed = JSON.parse(String(reader.result || "{}"));
+          const rawParsed = JSON.parse(String(reader.result || "{}"));
+          const bk = (rawParsed && rawParsed.backup && typeof rawParsed.backup === "object") ? rawParsed.backup : rawParsed;
+          const favSnapshots = (bk && bk.favorite_snapshots && typeof bk.favorite_snapshots === "object") ? bk.favorite_snapshots : {};
+          const favIpSet = new Set();
+          Object.values(favSnapshots).forEach(s => {
+            if (s && typeof s === "object") {
+              delete s.config_text;
+              delete s.config_file;
+              delete s.cleanip_report;
+              delete s.intel_report;
+              const ip = s.ip || s.remote_host;
+              if (ip) favIpSet.add(String(ip).trim());
+            }
+          });
+          if (bk && bk.ip_cache && typeof bk.ip_cache === "object") {
+            const slimCache = {};
+            Object.entries(bk.ip_cache).forEach(([ipKey, entry]) => {
+              if ((favIpSet.size === 0 || favIpSet.has(ipKey)) && entry && typeof entry === "object") {
+                const copy = Object.assign({}, entry);
+                delete copy.cleanip_report;
+                delete copy.intel_report;
+                slimCache[ipKey] = copy;
+              }
+            });
+            bk.ip_cache = slimCache;
+          }
           const res = await fetchWithTimeout("./api/import_backup", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ backup: parsed })
+            body: JSON.stringify({ backup: bk })
           }, 25000);
           const data = await readJsonResponse(res, "导入备份恢复失败");
           toast(data.message || "备份恢复成功 · 已恢复星标节点与纯净度缓存", "ok");
@@ -9903,7 +9957,7 @@ class Handler(BaseHTTPRequestHandler):
 
         elif effective_path == "/api/import_backup":
             try:
-                payload = self.read_json_body()
+                payload = self.read_json_body(max_bytes=10 * 1024 * 1024)
                 res = import_saved_nodes_backup(payload)
                 self.send_json(res)
             except ValueError as exc:
@@ -9914,7 +9968,7 @@ class Handler(BaseHTTPRequestHandler):
 
         elif effective_path == "/api/import_nodes":
             try:
-                payload = self.read_json_body()
+                payload = self.read_json_body(max_bytes=2 * 1024 * 1024)
                 imported_nodes, imported_ids = parse_and_import_manual_nodes(payload)
                 auto_probe = bool(payload.get("auto_probe", True))
                 if auto_probe and imported_ids and not maintenance_lock.locked() and not is_connecting:
