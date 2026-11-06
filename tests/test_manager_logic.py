@@ -1401,6 +1401,58 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(manager.node_matches_region(node_osaka, ["Tokyo", "Osaka"]))
         self.assertFalse(manager.node_matches_region(node_fukuoka, "东京都,大阪府"))
 
+    def test_export_and_import_saved_nodes_backup_preserves_favorites_and_scores(self) -> None:
+        nodes = self.write_nodes(2)
+        fav_node = nodes[0]
+        fav_node["proto"] = "sslvpn"
+        fav_node["remote_port"] = 443
+        fav_node["location"] = "日本 · 东京都 · 东京"
+        fav_node["cleanip_score"] = 97
+        fav_node["cleanip_grade"] = "A+"
+        fav_node["intel_score"] = 97
+        fav_node["intel_grade"] = "A+"
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager.vpn_utils.save_ip_cache(
+            {
+                fav_node["ip"]: {
+                    "location": "日本 · 东京都 · 东京",
+                    "cleanip_score": 97,
+                    "cleanip_grade": "A+",
+                    "intel_score": 97,
+                    "intel_grade": "A+",
+                }
+            }
+        )
+        ui_cfg = manager.load_ui_config()
+        ui_cfg["favorite_node_ids"] = [fav_node["id"]]
+        ui_cfg["fav_region"] = "东京都,大阪府"
+        manager.write_json(manager.DATA_DIR / "ui_auth.json", ui_cfg)
+        manager.sync_favorite_snapshots_with_nodes(fav_ids=[fav_node["id"]], nodes=nodes)
+
+        backup_data = manager.export_saved_nodes_backup()
+        self.assertEqual([fav_node["id"]], backup_data["favorite_node_ids"])
+        self.assertIn(fav_node["id"], backup_data["favorite_snapshots"])
+        self.assertIn(fav_node["ip"], backup_data["ip_cache"])
+
+        # Simulate fresh VPS with empty favorites, empty nodes, and empty IP cache
+        manager.write_json(manager.NODES_FILE, [])
+        manager.write_json(manager.FAVORITES_FILE, {})
+        manager.vpn_utils.save_ip_cache({})
+        fresh_cfg = manager.load_ui_config()
+        fresh_cfg["favorite_node_ids"] = []
+        fresh_cfg["fav_region"] = ""
+        manager.write_json(manager.DATA_DIR / "ui_auth.json", fresh_cfg)
+
+        restore_res = manager.import_saved_nodes_backup({"backup": backup_data})
+        self.assertTrue(restore_res["ok"])
+        self.assertEqual(1, restore_res["restored_favorites"])
+        restored_nodes = manager.read_nodes()
+        self.assertEqual(1, len(restored_nodes))
+        self.assertEqual(fav_node["id"], restored_nodes[0]["id"])
+        self.assertEqual("sslvpn", restored_nodes[0]["proto"])
+        self.assertEqual(97, restored_nodes[0]["cleanip_score"])
+        self.assertEqual("东京都,大阪府", manager.load_ui_config()["fav_region"])
+
 
 class ProxyServerConcurrencyTests(unittest.TestCase):
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:

@@ -1688,6 +1688,183 @@ def parse_and_import_manual_nodes(
     return imported_nodes, imported_ids
 
 
+def export_saved_nodes_backup() -> dict[str, Any]:
+    """
+    Export all starred/saved nodes, their .ovpn configurations, adaptive protocols,
+    routing region preferences, and cached CleanIP / 3-source intelligence reports into a portable JSON dict.
+    """
+    with lock:
+        ui_cfg = load_ui_config()
+        fav_ids = [
+            str(fid).strip()
+            for fid in ui_cfg.get("favorite_node_ids", [])
+            if str(fid or "").strip()
+        ]
+        current_nodes = sync_favorite_snapshots_with_nodes(fav_ids=fav_ids)
+        snapshots = load_favorite_snapshots()
+        node_by_id = {str(n.get("id")): n for n in current_nodes if n.get("id")}
+
+        export_snapshots: dict[str, dict[str, Any]] = {}
+        relevant_ips: set[str] = set()
+        for fid in fav_ids:
+            snap = dict(snapshots.get(fid) or node_by_id.get(fid) or {})
+            if not snap.get("id"):
+                continue
+            if not snap.get("config_text") and snap.get("config_file"):
+                try:
+                    cpath = Path(str(snap["config_file"]))
+                    if cpath.exists():
+                        snap["config_text"] = cpath.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+            snap["active"] = False
+            export_snapshots[fid] = snap
+            ip_val = str(snap.get("ip") or snap.get("remote_host") or "").strip()
+            if ip_val:
+                relevant_ips.add(ip_val)
+
+        full_ip_cache = vpn_utils.load_ip_cache()
+        exported_ip_cache: dict[str, Any] = {}
+        if isinstance(full_ip_cache, dict):
+            for ip_key, cache_val in full_ip_cache.items():
+                if not isinstance(cache_val, dict):
+                    continue
+                has_scores = (
+                    cache_val.get("cleanip_score") not in (None, "")
+                    or cache_val.get("intel_score") not in (None, "")
+                )
+                if ip_key in relevant_ips or has_scores:
+                    exported_ip_cache[str(ip_key)] = cache_val
+
+        return {
+            "schema": "aimilivpn_backup_v1",
+            "exported_at": time.time(),
+            "app_version": APP_VERSION,
+            "favorite_node_ids": fav_ids,
+            "fav_region": str(ui_cfg.get("fav_region") or ""),
+            "discovery_countries": normalize_discovery_countries(ui_cfg.get("discovery_countries")),
+            "favorite_snapshots": export_snapshots,
+            "ip_cache": exported_ip_cache,
+        }
+
+
+def import_saved_nodes_backup(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Restore starred/saved nodes, .ovpn files, and CleanIP / 3-source intelligence cache from a backup JSON dict.
+    """
+    data = payload.get("backup") if isinstance(payload.get("backup"), dict) else payload
+    if not isinstance(data, dict):
+        raise ValueError("无效的备份文件格式")
+
+    raw_fav_ids = data.get("favorite_node_ids")
+    raw_snapshots = data.get("favorite_snapshots")
+    raw_ip_cache = data.get("ip_cache")
+
+    if not isinstance(raw_fav_ids, list) and not isinstance(raw_snapshots, dict):
+        raise ValueError("备份文件中未包含有效的星标节点数据 (favorite_node_ids / favorite_snapshots)")
+
+    restored_cache_count = 0
+    if isinstance(raw_ip_cache, dict) and raw_ip_cache:
+        current_cache = vpn_utils.load_ip_cache()
+        if not isinstance(current_cache, dict):
+            current_cache = {}
+        for ip_key, entry in raw_ip_cache.items():
+            if ip_key and isinstance(entry, dict):
+                current_cache[str(ip_key)] = entry
+                restored_cache_count += 1
+        vpn_utils.save_ip_cache(current_cache)
+
+    restored_fav_count = 0
+    with lock:
+        ui_cfg = load_ui_config()
+        fav_ids = [
+            str(fid).strip()
+            for fid in ui_cfg.get("favorite_node_ids", [])
+            if str(fid or "").strip()
+        ]
+        snapshots = load_favorite_snapshots()
+        current_nodes = read_nodes()
+
+        incoming_snapshots = raw_snapshots if isinstance(raw_snapshots, dict) else {}
+        incoming_ids: list[str] = []
+        if isinstance(raw_fav_ids, list):
+            for fid in raw_fav_ids:
+                s_fid = str(fid or "").strip()
+                if s_fid and s_fid not in incoming_ids:
+                    incoming_ids.append(s_fid)
+        for fid in incoming_snapshots.keys():
+            s_fid = str(fid or "").strip()
+            if s_fid and s_fid not in incoming_ids:
+                incoming_ids.append(s_fid)
+
+        for fid in incoming_ids:
+            snap = incoming_snapshots.get(fid)
+            if isinstance(snap, dict) and snap.get("id"):
+                node_copy = dict(snap)
+                node_copy["id"] = fid
+                node_copy["active"] = False
+                cfg_path = CONFIG_DIR / f"{safe_name(fid)}.ovpn"
+                node_copy["config_file"] = str(cfg_path)
+                cfg_text = str(node_copy.get("config_text") or "")
+                if not cfg_text:
+                    ip_val = str(node_copy.get("ip") or node_copy.get("remote_host") or "")
+                    port_val = parse_int(node_copy.get("remote_port")) or 443
+                    proto_val = str(node_copy.get("proto") or "tcp")
+                    cfg_text = synthesize_vpngate_openvpn_config(ip_val, port_val, proto_val, nodes=current_nodes)
+                    node_copy["config_text"] = cfg_text
+                if cfg_text:
+                    try:
+                        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+                        cfg_path.write_text(cfg_text, encoding="utf-8")
+                    except Exception:
+                        pass
+                snapshots[fid] = node_copy
+                restored_fav_count += 1
+            else:
+                reconstructed = reconstruct_favorite_node_from_disk(fid, nodes=current_nodes)
+                if reconstructed is not None:
+                    snapshots[fid] = reconstructed
+                    restored_fav_count += 1
+
+            if fid not in fav_ids:
+                fav_ids.append(fid)
+
+        ui_cfg["favorite_node_ids"] = fav_ids
+        if data.get("fav_region") and not ui_cfg.get("fav_region"):
+            ui_cfg["fav_region"] = ",".join(normalize_region_list(data.get("fav_region")))
+
+        save_favorite_snapshots(snapshots)
+        write_json(DATA_DIR / "ui_auth.json", ui_cfg)
+
+        merged_nodes = sync_favorite_snapshots_with_nodes(fav_ids=fav_ids, nodes=current_nodes)
+        ip_cache_now = vpn_utils.load_ip_cache()
+        if isinstance(ip_cache_now, dict):
+            for n in merged_nodes:
+                nip = str(n.get("ip") or n.get("remote_host") or "").strip()
+                if nip and isinstance(ip_cache_now.get(nip), dict):
+                    vpn_utils.apply_ip_cache_entry(n, ip_cache_now[nip])
+        sorted_nodes = sort_all_nodes(merged_nodes)
+        write_json(NODES_FILE, sorted_nodes)
+        save_favorite_snapshots({
+            str(n.get("id")): dict(n)
+            for n in sorted_nodes
+            if str(n.get("id")) in set(fav_ids)
+        })
+
+    log_to_json(
+        "INFO",
+        "Main",
+        f"[备份恢复] 成功恢复 {restored_fav_count} 个星标节点与 {restored_cache_count} 条 IP 纯净度缓存记录",
+    )
+    return {
+        "ok": True,
+        "restored_favorites": restored_fav_count,
+        "restored_ip_cache": restored_cache_count,
+        "favorite_node_ids": fav_ids,
+        "message": f"成功恢复 {restored_fav_count} 个星标节点及 {restored_cache_count} 条纯净度缓存记录",
+    }
+
+
 def merge_supplemental_candidates(
     primary_candidates: list[dict[str, Any]],
     primary_source_name: str,
@@ -6053,7 +6230,12 @@ table.nodes{width:100%;min-width:1120px;border-collapse:separate;border-spacing:
             <button class="btn btn-sm btn-tint btn-blue" data-pool="eval" type="button">🛡️ 星标全部 CleanIP</button>
             <button class="btn btn-sm btn-tint btn-violet" data-pool="multi" type="button">🔍 星标全部三源对比</button>
             <button class="btn btn-sm" data-pool="select" type="button">☑ 勾选全部星标</button>
-            <button class="btn btn-sm btn-ghost" data-pool="export" type="button"><i data-i="download"></i>复制星标地址</button>
+            <button class="btn btn-sm btn-ghost" data-pool="export" type="button"><i data-i="copy"></i>复制星标地址</button>
+            <button class="btn btn-sm btn-ghost" data-pool="backup_export" type="button" title="导出包含星标节点、自适应协议及 CleanIP/三源纯净度评分缓存的迁移备份包 (.json)"><i data-i="download"></i>导出备份 (.json)</button>
+            <label class="btn btn-sm btn-ghost" style="cursor:pointer;margin:0;" title="上传从旧 VPS 导出的 .json 备份文件，一键无损恢复星标节点与纯净度缓存">
+              <i data-i="upload"></i>导入备份恢复
+              <input type="file" id="poolBackupFile" accept=".json,application/json" style="display:none;">
+            </label>
           </div>
           <div class="tip-amber"><span>💡</span><span id="poolTip">星标节点已启用防丢持久化保护：刷新订阅后自动保留在列表中。</span></div>
         </div>
@@ -8623,6 +8805,28 @@ qsa('[data-pool]').forEach(b => b.addEventListener('click', () => {
       copyText(lines.join('\n'), '星标节点地址列表已复制到剪贴板');
       break;
     }
+    case 'backup_export': {
+      (async () => {
+        try {
+          const res = await fetchWithTimeout(apiPath('/api/export_backup'), {}, 20000);
+          const data = await readJsonResponse(res, '导出星标备份失败');
+          const blob = new Blob([JSON.stringify(data.backup || data, null, 2)], { type: 'application/json;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          const dStr = new Date().toISOString().slice(0, 10);
+          a.href = url;
+          a.download = `aimilivpn-stars-backup-${dStr}.json`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          toast('备份导出成功', `已导出 ${favIds.length} 个星标节点及纯净度缓存`, 'ok');
+        } catch (err) {
+          toast('导出备份失败', err.message || String(err), 'err');
+        }
+      })();
+      break;
+    }
   }
 }));
 
@@ -8770,6 +8974,30 @@ if ($("syncBtn")) {
 }
 
 if ($("openVpsBtn")) {
+  if ($("poolBackupFile")) {
+    $("poolBackupFile").addEventListener("change", (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const parsed = JSON.parse(String(reader.result || "{}"));
+          const res = await fetchWithTimeout(apiPath("/api/import_backup"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ backup: parsed })
+          }, 25000);
+          const data = await readJsonResponse(res, "导入备份恢复失败");
+          toast("备份恢复成功", data.message || "已恢复星标节点与纯净度缓存", "ok");
+          await load(true);
+        } catch (err) {
+          toast("备份恢复失败", err.message || "请确认上传的是有效的 .json 备份文件", "err");
+        }
+      };
+      reader.readAsText(file, "utf-8");
+      ev.target.value = "";
+    });
+  }
   if ($("importNodeBtn")) {
     $("importNodeBtn").addEventListener("click", () => openModal("importModal"));
   }
@@ -9352,6 +9580,11 @@ class Handler(BaseHTTPRequestHandler):
                     pinger_status
                 ]
             })
+        elif effective_path == "/api/export_backup":
+            try:
+                self.send_json({"ok": True, "backup": export_saved_nodes_backup()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/logs":
             logs_dir = DATA_DIR / "logs"
             date_str = time.strftime("%Y-%m-%d", time.localtime())
@@ -9653,6 +9886,17 @@ class Handler(BaseHTTPRequestHandler):
                     policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "收藏列表已更新")
                 
                 self.send_json({"ok": True, "favorite_node_ids": fav_ids, "message": policy_message or ""})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/import_backup":
+            try:
+                payload = self.read_json_body()
+                res = import_saved_nodes_backup(payload)
+                self.send_json(res)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
